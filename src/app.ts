@@ -27,12 +27,15 @@ export function createApp() {
   app.get("/health", (c) => c.json({ ok: true }));
   app.get("/ready", async (c) => {
     await libsql.execute("select 1");
+    const r2Configured = Boolean(config.R2_ACCOUNT_ID && config.R2_ACCESS_KEY_ID && config.R2_SECRET_ACCESS_KEY && (config.R2_BUCKET_NAME || config.R2_BUCKET));
+    const emailConfigured = Boolean(config.BREVO_API_KEY && config.EMAIL_FROM);
+    const ok = !isProduction || (r2Configured && emailConfigured);
     return c.json({
-      ok: true,
+      ok,
       db: true,
-      r2Configured: Boolean(config.R2_ACCOUNT_ID && config.R2_ACCESS_KEY_ID && config.R2_SECRET_ACCESS_KEY && (config.R2_BUCKET_NAME || config.R2_BUCKET)),
-      emailConfigured: Boolean(config.BREVO_API_KEY && config.EMAIL_FROM),
-    });
+      r2Configured,
+      emailConfigured,
+    }, ok ? 200 : 503);
   });
 
   registerAuthRoutes(app);

@@ -11,6 +11,7 @@
     "db:migrate": "drizzle-kit migrate",
     "seed": "tsx src/seed.ts",
     "smoke": "tsx src/smoke.ts",
+    "verify:schema": "tsx src/verify-schema.ts",
     "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
