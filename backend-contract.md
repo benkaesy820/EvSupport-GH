@@ -31,6 +31,8 @@ This backend is the source of truth for roles, permissions, state transitions, f
 - `GET /admin/audit-logs`
 - `PATCH /admin/settings`
 
+Admins are seed/SQL-only. `POST /admin/users` creates agents only. Customers either self-register or are invited, then require admin approval before login. Admin user/customer/agent list rows include backend-computed `availableActions`. Dashboard counts include pending customers and chats resolved today.
+
 ## Support Chat
 
 - `GET /chats`
@@ -109,6 +111,7 @@ Team Chat is admin/agent only. There are no private DMs. Messages support attach
 
 SSE is a delivery hint. Clients should refetch `me`, notifications, chats, open chat messages, and Team Chat after reconnect.
 `GET /admin/audit-logs` supports cursor pagination plus `action`, `resourceType`, and `actorId` filters.
+Customer approval flows emit `customer:pending_approval` and `customer:approved` in addition to notification events.
 
 ## Verification
 
@@ -116,4 +119,3 @@ SSE is a delivery hint. Clients should refetch `me`, notifications, chats, open 
 - `npm run build`
 - `npm test` uses isolated file-backed SQLite.
 - `npm run smoke` uses the configured live backend/database.
-Admins are seed/SQL-only. `POST /admin/users` creates agents only. Customers either self-register or are invited, then require admin approval before login.

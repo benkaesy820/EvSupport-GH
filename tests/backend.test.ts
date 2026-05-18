@@ -177,8 +177,8 @@ test("customer registration, customer invite, approval, and admin creation restr
   assert.equal(registered.approvalRequired, true);
   await apiRequest("POST", "/auth/login", { email: `registered-${suffix}@evcomm.test`, password: `Registered-${suffix}-Password-123!` }, 403);
 
-  const pendingCustomers = await admin.request<{ items: Array<{ id: string; status: string }> }>("GET", "/admin/customers");
-  assert.ok(pendingCustomers.items.some((customer) => customer.id === registered.user.id && customer.status === "pending_approval"));
+  const pendingCustomers = await admin.request<{ items: Array<{ id: string; status: string; availableActions: { approve: boolean } }> }>("GET", "/admin/customers");
+  assert.ok(pendingCustomers.items.some((customer) => customer.id === registered.user.id && customer.status === "pending_approval" && customer.availableActions.approve));
   await admin.request("POST", `/admin/users/${registered.user.id}/approve`);
   await login(`registered-${suffix}@evcomm.test`, `Registered-${suffix}-Password-123!`);
 
@@ -209,6 +209,10 @@ test("customer registration, customer invite, approval, and admin creation restr
 
   const audit = await admin.request<{ items: Array<{ action: string }> }>("GET", "/admin/audit-logs?action=customer_approved");
   assert.ok(audit.items.some((item) => item.action === "customer_approved"));
+  const pendingEvents = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.event, "customer:pending_approval"));
+  const approvedEvents = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.event, "customer:approved"));
+  assert.ok(pendingEvents.length >= 2);
+  assert.ok(approvedEvents.length >= 2);
 });
 
 test("chat permissions, state transitions, unread counts, notes, and idempotency work", async () => {
@@ -404,6 +408,12 @@ test("search, audit filters, notifications, and SSE reconnect state are role-awa
   assert.ok(!("users" in customerSearch.groups));
   const adminSearch = await admin.request<{ groups: Record<string, unknown[]> }>("GET", "/search?q=Searchable");
   assert.ok(Array.isArray(adminSearch.groups.announcements));
+
+  const dashboard = await admin.request<{ counts: { pendingCustomers: number; resolvedToday: number } }>("GET", "/admin/dashboard");
+  assert.equal(typeof dashboard.counts.pendingCustomers, "number");
+  assert.equal(typeof dashboard.counts.resolvedToday, "number");
+  const agents = await admin.request<{ items: Array<{ availableActions: { suspend: boolean; revoke_sessions: boolean } }> }>("GET", "/admin/agents");
+  assert.ok(agents.items.every((item) => typeof item.availableActions.suspend === "boolean" && typeof item.availableActions.revoke_sessions === "boolean"));
 
   const audit = await admin.request<{ items: Array<{ action: string }> }>("GET", "/admin/audit-logs?action=announcement_published");
   assert.ok(audit.items.some((item) => item.action === "announcement_published"));

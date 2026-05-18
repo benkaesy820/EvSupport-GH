@@ -3,7 +3,7 @@ import { hash, verify } from "@node-rs/argon2";
 import { Hono } from "hono";
 import { getCookie, deleteCookie } from "hono/cookie";
 import { jwtVerify } from "jose";
-import { and, count, desc, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, gte, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db.js";
 import { agents, customers, notifications, passwordResetTokens, supportChats, teamMessages, twoFactorChallenges, userSessions, users } from "./schema.js";
@@ -83,6 +83,15 @@ function publicUser(row: typeof users.$inferSelect) {
     status: row.status,
     timezone: row.timezone,
     twoFactorEnabled: row.twoFactorEnabled,
+  };
+}
+
+function adminUserActions(row: Pick<typeof users.$inferSelect, "id" | "role" | "status">, actorId: string) {
+  return {
+    approve: row.role === "customer" && row.status === "pending_approval",
+    suspend: row.id !== actorId && row.status === "active",
+    anonymize: row.id !== actorId && row.status !== "anonymized",
+    revoke_sessions: row.id !== actorId && row.status !== "anonymized",
   };
 }
 
@@ -180,6 +189,7 @@ export function registerAuthRoutes(app: Hono) {
     const [created] = await db.select().from(users).where(eq(users.id, id)).limit(1);
     await audit(actorFromUser(created), "customer_registered", "user", id, {}, c.get("requestId"));
     await notifyAdmins("customer_pending_approval", "user", id, "Customer awaiting approval", `${created.displayName} registered and is waiting for approval.`, "customer-pending");
+    await publishEvent([adminChannel], "customer:pending_approval", { resourceId: id, userId: id, actor: actorFromUser(created) });
     return c.json({ user: publicUser(created), approvalRequired: true }, 201);
   });
 
@@ -432,10 +442,12 @@ export function registerAuthRoutes(app: Hono) {
     await notifyAdmins("customer_pending_approval", "user", id, "Customer awaiting approval", `${body.displayName} was invited and is waiting for approval.`, "customer-pending");
     await sendCustomerInvite(body.email, token).catch((error) => console.error("customer invite email failed", error));
     const [created] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    await publishEvent([adminChannel], "customer:pending_approval", { resourceId: id, userId: id, actor });
     return c.json({ user: publicUser(created), debugSetupToken: isProduction ? undefined : token }, 201);
   });
 
   app.get("/admin/users", requireAuth, requireRole("admin"), async (c: AppContext) => {
+    const actor = c.get("actor");
     const role = c.req.query("role");
     const filters = role === "admin" || role === "agent" || role === "customer" ? eq(users.role, role) : undefined;
     const rows = await db
@@ -444,10 +456,11 @@ export function registerAuthRoutes(app: Hono) {
       .where(filters)
       .orderBy(desc(users.createdAt))
       .limit(100);
-    return c.json({ items: rows });
+    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions(row, actor.id) })) });
   });
 
   app.get("/admin/agents", requireAuth, requireRole("admin"), async (c: AppContext) => {
+    const actor = c.get("actor");
     const rows = await db
       .select({
         id: users.id,
@@ -467,10 +480,11 @@ export function registerAuthRoutes(app: Hono) {
       .leftJoin(supportChats, eq(supportChats.assignedAgentId, agents.userId))
       .groupBy(users.id, agents.userId)
       .limit(100);
-    return c.json({ items: rows });
+    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions({ id: row.id, role: "agent", status: row.status }, actor.id) })) });
   });
 
   app.get("/admin/customers", requireAuth, requireRole("admin"), async (c: AppContext) => {
+    const actor = c.get("actor");
     const rows = await db
       .select({
         id: users.id,
@@ -486,7 +500,7 @@ export function registerAuthRoutes(app: Hono) {
       .innerJoin(users, eq(users.id, customers.userId))
       .leftJoin(supportChats, eq(supportChats.customerId, customers.userId))
       .limit(100);
-    return c.json({ items: rows });
+    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions({ id: row.id, role: "customer", status: row.status }, actor.id) })) });
   });
 
   app.post("/admin/users/:id/approve", requireAuth, requireRole("admin"), async (c: AppContext) => {
@@ -511,6 +525,7 @@ export function registerAuthRoutes(app: Hono) {
     }).onConflictDoNothing();
     await publishEvent([userChannel(targetId)], "notification:new", { resourceId: notificationId, notificationId, resourceType: "user" });
     const [updated] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+    await publishEvent([userChannel(targetId), adminChannel], "customer:approved", { resourceId: targetId, userId: targetId, actor });
     return c.json({ user: publicUser(updated) });
   });
 
@@ -519,13 +534,19 @@ export function registerAuthRoutes(app: Hono) {
     const [waiting] = await db.select({ value: count() }).from(supportChats).where(eq(supportChats.status, "waiting"));
     const [unassigned] = await db.select({ value: count() }).from(supportChats).where(isNull(supportChats.assignedAgentId));
     const [activeAgents] = await db.select({ value: count() }).from(users).where(and(eq(users.role, "agent"), eq(users.status, "active")));
+    const [pendingCustomers] = await db.select({ value: count() }).from(users).where(and(eq(users.role, "customer"), eq(users.status, "pending_approval")));
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const [resolvedToday] = await db.select({ value: count() }).from(supportChats).where(and(eq(supportChats.status, "resolved"), gte(supportChats.updatedAt, today.toISOString())));
     const [pendingReports] = await db.select({ value: count() }).from(notifications).where(and(eq(notifications.resourceType, "report"), isNull(notifications.readAt)));
     return c.json({
       counts: {
         openChats: open.value,
         waitingChats: waiting.value,
         unassignedChats: unassigned.value,
+        resolvedToday: resolvedToday.value,
         activeAgents: activeAgents.value,
+        pendingCustomers: pendingCustomers.value,
         pendingReportNotifications: pendingReports.value,
       },
     });
