@@ -90,6 +90,21 @@ Status legend: ✅ done · 🟡 partial · ⬜ todo · ⛔ locked (won't do).
 - ✅ `POST /chats/:id/messages` response includes attached files + sender (consistent with `GET /chats/:id`).
 - ✅ 8 new test cases (20 total, all passing): 2FA enrollment + disable, `/customers/:id` scoping, inbox filter aliases, reactions toggle, comments listing, auto-chat + sender enrichment, resolve idempotency + close-ends-assignment, sessions filter.
 
+### Pass 3 — Hardening before GitHub push
+
+- ✅ Settings contract tightened; file policy, slow-lane email toggles, and default chat priority now honor `system_settings`.
+- ✅ File flow hardened: `resourceType`/`resourceId` must be paired, unattached downloads are owner-only, and only pending uploads can be completed.
+- ✅ Report evidence is scoped to messages visible to the reporting customer.
+- ✅ New reports create durable admin notification rows; duplicate notification SSE only emits when a notification row is inserted.
+- ✅ Bulk read receipts for chat and team messages now mark all prior visible unread messages, not just one cursor row.
+- ✅ Already-published announcements cannot be published/scheduled again; customer announcement pagination was tightened.
+- ✅ Assignment state is cleaned on close, reopen, and customer anonymization; agent `lastAssignedAt` is updated on claim/assign/transfer.
+- ✅ Unassigned chat creation emits team-channel realtime hints for agents/admins.
+- ✅ Root `.gitignore` restored for secrets and runtime artifacts (`.env`, `.claude`, `node_modules`, `dist`, logs, local SQLite).
+- ✅ `tsconfig.json` now typechecks tests.
+- ✅ 6 additional backend tests added (26 total, all passing).
+- ✅ Repository was moved to GitHub `main` and force-pushed at commit `f0fe72c`.
+
 ---
 
 ## In progress
@@ -108,7 +123,6 @@ _Nothing currently in progress._
 
 ### Lifecycle hygiene
 
-- ⬜ Reopening a closed chat (admin closed→open) leaves `supportChats.assignedAgentId` set but no open `chat_assignments` row. Either null out the agent on reopen-from-closed OR insert a new assignment row.
 - ⬜ Block destructive admin actions when only one active admin remains (anonymize / suspend / revoke-all-sessions). Currently only self-action is blocked.
 - ⬜ `DELETE /internal-notes/:id` for the note author or admin (column `deletedAt` already exists, route doesn't).
 - ⬜ `GET /admin/agents/:id` single-agent detail (currently only list `/admin/agents`).
@@ -120,9 +134,11 @@ _Nothing currently in progress._
 - ⬜ Notification retention: delete `notifications` rows where `readAt < now() - 90d` (or per a configurable retention setting).
 - ⬜ Audit log retention policy decision: today it's append-only forever. Either document "no retention" formally OR add an archival cron.
 
-### Security tightening
+### Security / deployment
 
-- ⬜ Unattached file download leak: `canAccessResource` returns `true` when `resourceType` is null. Anyone with a file ID can download an unattached file. Tighten to "owner only" for unattached files; avatar files specifically can have a public-readable path if needed.
+- ⬜ Rotate any credentials that ever lived in local `backend/.env`; replace them in the deployment/GitHub secret store.
+- ⬜ Confirm production deploy/build commands use `backend/` as the working directory after the repo move.
+- ⬜ Run live `npm run db:migrate`, `npm run verify:schema`, and `npm run smoke` against the deployed environment after secrets are rotated.
 
 ### Tests still missing for new routes
 
@@ -213,10 +229,11 @@ All of the below have explicit user-approved decisions. Document, don't implemen
 | --- | --- |
 | `npm run typecheck` | ✅ clean |
 | `npm run build` | ✅ clean |
-| `npm test` | ✅ 20 / 20 pass |
-| `npm run db:migrate` (Turso) | ✅ 0005 applied |
-| `npm run verify:schema` (Turso) | ✅ `{ ok: true, tables: 32, indexes: 15 }` |
-| `npm run smoke` (live local) | ✅ 18 checks pass |
+| `npm test` | ✅ 26 / 26 pass |
+| GitHub push | ✅ `main` force-pushed at `f0fe72c` |
+| `npm run db:migrate` (Turso) | ⚠️ previously clean; rerun after deploy/secret rotation |
+| `npm run verify:schema` (Turso) | ⚠️ previously clean; rerun after deploy/secret rotation |
+| `npm run smoke` (live local) | ⚠️ previously clean; rerun after deploy/secret rotation |
 | Manual /me spot-check | ✅ `lastActiveAt` populated, `agent` field present for agents, `avatarFileId` exposed |
 | Manual inbox-filter spot-check | ✅ `?filter=mine` and `?filter=unassigned` partition correctly |
 
@@ -252,7 +269,7 @@ backend/
     support.ts        (chats, messages, internal notes, assignments, takeover, ratings, customer profile, admin customer PATCH, ratings GET)
     verify-schema.ts  (asserts required tables/indexes exist in target DB)
   tests/
-    backend.test.ts   (20 tests; isolated file-backed SQLite)
+    backend.test.ts   (26 tests; isolated file-backed SQLite)
   backend-contract.md
   product-recommendations.md
   task.md             ← this file
