@@ -4,3 +4,10 @@ dist/
 migrate.log
 test.sqlite
 *.local
+.claude/
+
+backend/.env
+backend/node_modules/
+backend/dist/
+backend/migrate.log
+backend/test.sqlite

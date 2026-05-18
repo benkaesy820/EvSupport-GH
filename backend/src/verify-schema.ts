@@ -32,7 +32,6 @@ const requiredTables = [
   "system_settings",
   "idempotency_keys",
   "rate_limit_counters",
-  "outbox_events",
   "__drizzle_migrations",
 ];
 
@@ -52,7 +51,6 @@ const requiredIndexes = [
   "team_messages_created_idx",
   "audit_logs_resource_idx",
   "idempotency_keys_expires_idx",
-  "outbox_events_created_idx",
 ];
 
 async function names(type: "table" | "index") {

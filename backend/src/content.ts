@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
-import { and, count, desc, eq, inArray, isNull, like, lt, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db.js";
 import {
+  agents,
   announcementComments,
   announcementFiles,
   announcementReactions,
@@ -26,6 +27,7 @@ import {
 } from "./schema.js";
 import { actorKey, audit, fail, rateLimit, requireAuth, requireRole, withIdempotency, type AppContext } from "./security.js";
 import { adminChannel, publishEvent, teamChannel, userChannel } from "./events.js";
+import { sendReportStatusChanged } from "./email.js";
 
 const cursorSchema = z.object({ cursor: z.string().optional(), limit: z.coerce.number().int().min(1).max(100).default(30) });
 const announcementSchema = z.object({
@@ -60,7 +62,22 @@ const teamMessageSchema = z.object({
 const teamReadSchema = z.object({ messageId: z.string().optional() });
 const searchSchema = z.object({ q: z.string().trim().min(2).max(120), limit: z.coerce.number().int().min(1).max(25).default(10) });
 const internalCommentSchema = z.object({ body: z.string().trim().min(1).max(5000) });
-const settingsSchema = z.record(z.union([z.string(), z.number(), z.boolean(), z.array(z.string()), z.record(z.unknown())]));
+const settingsSchema = z.object({
+  maxFileSize: z.number().int().positive().max(50 * 1024 * 1024).optional(),
+  allowedFileTypes: z.array(z.string().min(1).max(160)).min(1).max(25).optional(),
+  emailNotificationsEnabled: z.boolean().optional(),
+  supportAvailability: z.record(z.unknown()).optional(),
+  defaultTimezone: z.string().min(1).max(80).optional(),
+  queueBehavior: z.enum(["manual"]).optional(),
+  autoAssignmentEnabled: z.boolean().optional(),
+  defaultChatPriority: z.enum(["normal", "high", "urgent"]).optional(),
+}).strict();
+const availabilitySchema = z.object({
+  availability: z.enum(["available", "away", "offline"]).optional(),
+  skills: z.array(z.string().min(1).max(40)).max(20).optional(),
+  capacity: z.number().int().min(0).max(1000).optional(),
+});
+const quickRepliesSchema = z.object({ items: z.array(z.string().min(1).max(500)).max(50) });
 
 function announcementActions(role: string, status: string) {
   return {
@@ -103,26 +120,32 @@ async function customerAnnouncementVisible(userId: string, announcement: typeof 
   return Boolean(chats[0] && values.has(chats[0].category));
 }
 
-async function targetedCustomerIds(announcement: typeof announcements.$inferSelect) {
+export async function targetedCustomerIds(announcement: typeof announcements.$inferSelect) {
   const customerRows = await db.select({ userId: customers.userId, tags: customers.tags }).from(customers);
+  if (announcement.targetType === "all_customers") return customerRows.map((c) => c.userId);
   const targets = await db.select().from(announcementTargets).where(eq(announcementTargets.announcementId, announcement.id));
   const values = new Set(targets.map((target) => target.targetValue));
-  const ids: string[] = [];
-  for (const customer of customerRows) {
-    if (announcement.targetType === "all_customers" || (await customerAnnouncementVisible(customer.userId, announcement))) ids.push(customer.userId);
+  if (!values.size) return [];
+  if (announcement.targetType === "customer_tag") {
+    return customerRows.filter((customer) => customer.tags.some((tag) => values.has(tag))).map((c) => c.userId);
   }
-  return ids;
+  const ids = customerRows.map((c) => c.userId);
+  if (!ids.length) return [];
+  const chats = await db
+    .select({ customerId: supportChats.customerId, category: supportChats.category })
+    .from(supportChats)
+    .where(inArray(supportChats.customerId, ids));
+  const chatsByCustomer = new Map(chats.map((chat) => [chat.customerId, chat.category]));
+  return ids.filter((customerId) => {
+    const category = chatsByCustomer.get(customerId);
+    return Boolean(category && values.has(category));
+  });
 }
 
 async function notification(userId: string, type: string, resourceType: string, resourceId: string, title: string, body: string, dedupeKey?: string) {
   const id = randomUUID();
-  await db.insert(notifications).values({ id, userId, type, resourceType, resourceId, title, body, dedupeKey }).onConflictDoNothing();
-  await publishEvent([userChannel(userId)], "notification:new", { resourceId: id, notificationId: id, resourceType });
-}
-
-async function announcementFileRows(announcementId: string) {
-  const links = await db.select().from(announcementFiles).where(eq(announcementFiles.announcementId, announcementId));
-  return links.length ? await db.select().from(files).where(inArray(files.id, links.map((link) => link.fileId))) : [];
+  const inserted = await db.insert(notifications).values({ id, userId, type, resourceType, resourceId, title, body, dedupeKey }).onConflictDoNothing().returning({ id: notifications.id });
+  if (inserted.length) await publishEvent([userChannel(userId)], "notification:new", { resourceId: id, notificationId: id, resourceType });
 }
 
 async function teamMessageFileRows(messageId: string) {
@@ -138,11 +161,6 @@ function reportActions(role: string) {
   };
 }
 
-async function reportFileRows(reportId: string) {
-  const links = await db.select().from(reportFiles).where(eq(reportFiles.reportId, reportId));
-  return links.length ? await db.select().from(files).where(inArray(files.id, links.map((link) => link.fileId))) : [];
-}
-
 async function teamUnreadCount(userId: string) {
   const [row] = await db
     .select({ value: count() })
@@ -150,7 +168,7 @@ async function teamUnreadCount(userId: string) {
     .where(
       and(
         isNull(teamMessages.deletedAt),
-        sql`${teamMessages.senderId} is not ${userId}`,
+        ne(teamMessages.senderId, userId),
         sql`not exists (select 1 from team_message_reads tmr where tmr.message_id = ${teamMessages.id} and tmr.user_id = ${userId})`,
       ),
     );
@@ -176,6 +194,7 @@ export function registerContentRoutes(app: Hono) {
         defaultTimezone: settings.defaultTimezone ?? "UTC",
         queueBehavior: settings.queueBehavior ?? "manual",
         autoAssignmentEnabled: settings.autoAssignmentEnabled ?? false,
+        defaultChatPriority: settings.defaultChatPriority ?? "normal",
         quickReplies: settings.quickReplies ?? [
           "Thanks for reaching out. I am checking this now.",
           "Could you share a screenshot or file that shows the issue?",
@@ -183,6 +202,42 @@ export function registerContentRoutes(app: Hono) {
         ],
       },
     });
+  });
+
+  app.patch("/admin/quick-replies", requireAuth, requireRole("admin"), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const body = quickRepliesSchema.parse(await c.req.json());
+    const now = new Date().toISOString();
+    await db
+      .insert(systemSettings)
+      .values({ key: "quickReplies", value: body.items, updatedBy: actor.id, updatedAt: now })
+      .onConflictDoUpdate({ target: systemSettings.key, set: { value: body.items, updatedBy: actor.id, updatedAt: now } });
+    await audit(actor, "settings_changed", "system_settings", "quickReplies", { count: body.items.length }, c.get("requestId"));
+    return c.json({ items: body.items });
+  });
+
+  app.patch("/me/availability", requireAuth, requireRole("agent"), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const body = availabilitySchema.parse(await c.req.json());
+    if (body.skills !== undefined) fail("FORBIDDEN", "Skills are managed by admins.", 403);
+    if (body.capacity !== undefined) fail("FORBIDDEN", "Capacity is managed by admins.", 403);
+    const [existing] = await db.select().from(agents).where(eq(agents.userId, actor.id)).limit(1);
+    if (!existing) fail("NOT_FOUND", "Agent profile not found.", 404);
+    if (body.availability) await db.update(agents).set({ availability: body.availability }).where(eq(agents.userId, actor.id));
+    const [updated] = await db.select().from(agents).where(eq(agents.userId, actor.id)).limit(1);
+    return c.json({ agent: updated });
+  });
+
+  app.patch("/admin/agents/:id", requireAuth, requireRole("admin"), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const targetId = z.string().min(1).parse(c.req.param("id"));
+    const body = availabilitySchema.parse(await c.req.json());
+    const [existing] = await db.select().from(agents).where(eq(agents.userId, targetId)).limit(1);
+    if (!existing) fail("NOT_FOUND", "Agent was not found.", 404);
+    await db.update(agents).set({ ...body }).where(eq(agents.userId, targetId));
+    await audit(actor, "agent_updated", "user", targetId, body as Record<string, unknown>, c.get("requestId"));
+    const [updated] = await db.select().from(agents).where(eq(agents.userId, targetId)).limit(1);
+    return c.json({ agent: updated });
   });
 
   app.patch("/admin/settings", requireAuth, requireRole("admin"), async (c: AppContext) => {
@@ -201,35 +256,167 @@ export function registerContentRoutes(app: Hono) {
   app.get("/announcements", requireAuth, async (c: AppContext) => {
     const actor = c.get("actor");
     const query = cursorSchema.parse({ cursor: c.req.query("cursor"), limit: c.req.query("limit") ?? 30 });
-    const filters = [];
-    if (actor.role === "customer") filters.push(eq(announcements.status, "published"));
-    if (actor.role !== "admin") filters.push(sql`${announcements.status} != 'deleted'`);
-    if (query.cursor) filters.push(lt(announcements.createdAt, query.cursor));
+    const baseFilters: ReturnType<typeof eq>[] = [];
+    if (actor.role === "customer") baseFilters.push(eq(announcements.status, "published"));
+    if (actor.role !== "admin") baseFilters.push(ne(announcements.status, "deleted"));
 
-    const rows = await db.select().from(announcements).where(filters.length ? and(...filters) : undefined).orderBy(desc(announcements.createdAt)).limit(query.limit + 1);
-    const visibleRows = [];
-    for (const row of rows) {
-      if (actor.role !== "customer" || (await customerAnnouncementVisible(actor.id, row))) visibleRows.push(row);
-      if (visibleRows.length >= query.limit) break;
+    const loadBatch = (cursor?: string) =>
+      db
+        .select()
+        .from(announcements)
+        .where(and(...baseFilters, cursor ? lt(announcements.createdAt, cursor) : undefined))
+        .orderBy(desc(announcements.createdAt))
+        .limit(query.limit + 1);
+
+    let rows = await loadBatch(query.cursor);
+    let visibleRows = rows;
+    if (actor.role === "customer") {
+      const [profile] = await db.select().from(customers).where(eq(customers.userId, actor.id)).limit(1);
+      const [chat] = await db.select().from(supportChats).where(eq(supportChats.customerId, actor.id)).limit(1);
+      visibleRows = [];
+      let cursor = query.cursor;
+      for (let guard = 0; guard < 20 && visibleRows.length <= query.limit; guard++) {
+        rows = await loadBatch(cursor);
+        const candidateIds = rows.map((row) => row.id);
+        const targetRows = candidateIds.length
+          ? await db.select().from(announcementTargets).where(inArray(announcementTargets.announcementId, candidateIds))
+          : [];
+        const targetsByAnnouncement = new Map<string, Set<string>>();
+        for (const target of targetRows) {
+          const set = targetsByAnnouncement.get(target.announcementId) ?? new Set<string>();
+          set.add(target.targetValue);
+          targetsByAnnouncement.set(target.announcementId, set);
+        }
+        visibleRows.push(...rows.filter((row) => {
+          if (row.targetType === "all_customers") return true;
+          const targetSet = targetsByAnnouncement.get(row.id);
+          if (!targetSet?.size) return false;
+          if (row.targetType === "customer_tag") return Boolean(profile?.tags.some((tag) => targetSet.has(tag)));
+          return Boolean(chat && targetSet.has(chat.category));
+        }));
+        if (rows.length <= query.limit) break;
+        cursor = rows[rows.length - 1]?.createdAt;
+      }
     }
-    const items = await Promise.all(
-      visibleRows.map(async (item) => {
-        const reactionRows = await db
-          .select({ emoji: announcementReactions.emoji, total: count() })
+
+    const page = visibleRows.slice(0, query.limit);
+    const ids = page.map((row) => row.id);
+
+    const reactionRows = ids.length
+      ? await db
+          .select({ announcementId: announcementReactions.announcementId, emoji: announcementReactions.emoji, total: count() })
           .from(announcementReactions)
-          .where(eq(announcementReactions.announcementId, item.id))
-          .groupBy(announcementReactions.emoji);
-        const [commentCount] = await db.select({ value: count() }).from(announcementComments).where(and(eq(announcementComments.announcementId, item.id), isNull(announcementComments.deletedAt)));
-        return {
-          ...item,
-          files: await announcementFileRows(item.id),
-          commentCount: commentCount.value,
-          reactionCounts: Object.fromEntries(reactionRows.map((r) => [r.emoji, r.total])),
-          availableActions: announcementActions(actor.role, item.status),
-        };
-      }),
-    );
-    return c.json({ items, nextCursor: rows.length > query.limit ? rows[query.limit - 1]?.createdAt : null });
+          .where(inArray(announcementReactions.announcementId, ids))
+          .groupBy(announcementReactions.announcementId, announcementReactions.emoji)
+      : [];
+    const commentRows = ids.length
+      ? await db
+          .select({ announcementId: announcementComments.announcementId, total: count() })
+          .from(announcementComments)
+          .where(and(inArray(announcementComments.announcementId, ids), isNull(announcementComments.deletedAt)))
+          .groupBy(announcementComments.announcementId)
+      : [];
+    const fileLinks = ids.length
+      ? await db.select().from(announcementFiles).where(inArray(announcementFiles.announcementId, ids))
+      : [];
+    const fileRows = fileLinks.length
+      ? await db.select().from(files).where(inArray(files.id, fileLinks.map((link) => link.fileId)))
+      : [];
+
+    const reactionMap = new Map<string, Record<string, number>>();
+    for (const r of reactionRows) {
+      const obj = reactionMap.get(r.announcementId) ?? {};
+      obj[r.emoji] = r.total;
+      reactionMap.set(r.announcementId, obj);
+    }
+    const commentMap = new Map(commentRows.map((r) => [r.announcementId, r.total]));
+    const filesById = new Map(fileRows.map((f) => [f.id, f]));
+    const filesByAnnouncement = new Map<string, typeof fileRows>();
+    for (const link of fileLinks) {
+      const file = filesById.get(link.fileId);
+      if (!file) continue;
+      const arr = filesByAnnouncement.get(link.announcementId) ?? [];
+      arr.push(file);
+      filesByAnnouncement.set(link.announcementId, arr);
+    }
+
+    const items = page.map((row) => ({
+      ...row,
+      files: filesByAnnouncement.get(row.id) ?? [],
+      commentCount: commentMap.get(row.id) ?? 0,
+      reactionCounts: reactionMap.get(row.id) ?? {},
+      availableActions: announcementActions(actor.role, row.status),
+    }));
+    return c.json({ items, nextCursor: visibleRows.length > query.limit ? page[page.length - 1]?.createdAt : null });
+  });
+
+  app.get("/announcements/:id", requireAuth, async (c: AppContext) => {
+    const actor = c.get("actor");
+    const id = z.string().min(1).parse(c.req.param("id"));
+    const [announcement] = await db.select().from(announcements).where(eq(announcements.id, id)).limit(1);
+    if (!announcement || announcement.status === "deleted") fail("NOT_FOUND", "Announcement was not found.", 404);
+    if (actor.role === "customer" && !(await customerAnnouncementVisible(actor.id, announcement))) {
+      fail("FORBIDDEN", "Announcement is not available.", 403);
+    }
+    if (actor.role === "agent" && announcement.status !== "published") {
+      fail("FORBIDDEN", "Announcement is not available.", 403);
+    }
+    const reactionRows = await db
+      .select({ emoji: announcementReactions.emoji, total: count() })
+      .from(announcementReactions)
+      .where(eq(announcementReactions.announcementId, id))
+      .groupBy(announcementReactions.emoji);
+    const [commentCount] = await db
+      .select({ value: count() })
+      .from(announcementComments)
+      .where(and(eq(announcementComments.announcementId, id), isNull(announcementComments.deletedAt)));
+    const links = await db.select().from(announcementFiles).where(eq(announcementFiles.announcementId, id));
+    const fileRows = links.length ? await db.select().from(files).where(inArray(files.id, links.map((l) => l.fileId))) : [];
+    return c.json({
+      announcement: {
+        ...announcement,
+        files: fileRows,
+        reactionCounts: Object.fromEntries(reactionRows.map((r) => [r.emoji, r.total])),
+        commentCount: commentCount.value,
+        availableActions: announcementActions(actor.role, announcement.status),
+      },
+    });
+  });
+
+  app.get("/announcements/:id/comments", requireAuth, async (c: AppContext) => {
+    const actor = c.get("actor");
+    const id = z.string().min(1).parse(c.req.param("id"));
+    const query = cursorSchema.parse({ cursor: c.req.query("cursor"), limit: c.req.query("limit") ?? 30 });
+    const [announcement] = await db.select().from(announcements).where(eq(announcements.id, id)).limit(1);
+    if (!announcement || announcement.status === "deleted") fail("NOT_FOUND", "Announcement was not found.", 404);
+    if (actor.role === "customer" && !(await customerAnnouncementVisible(actor.id, announcement))) {
+      fail("FORBIDDEN", "Announcement is not available.", 403);
+    }
+    if (actor.role === "agent" && announcement.status !== "published") {
+      fail("FORBIDDEN", "Announcement is not available.", 403);
+    }
+    const rows = await db
+      .select()
+      .from(announcementComments)
+      .where(
+        and(
+          eq(announcementComments.announcementId, id),
+          isNull(announcementComments.deletedAt),
+          query.cursor ? lt(announcementComments.createdAt, query.cursor) : undefined,
+        ),
+      )
+      .orderBy(desc(announcementComments.createdAt))
+      .limit(query.limit + 1);
+    const page = rows.slice(0, query.limit);
+    const authorIds = [...new Set(page.map((r) => r.authorId))];
+    const authorRows = authorIds.length
+      ? await db.select({ id: users.id, displayName: users.displayName, role: users.role, status: users.status }).from(users).where(inArray(users.id, authorIds))
+      : [];
+    const authorMap = new Map(authorRows.map((u) => [u.id, u]));
+    return c.json({
+      items: page.map((row) => ({ ...row, author: authorMap.get(row.authorId) ?? null })),
+      nextCursor: rows.length > query.limit ? rows[query.limit - 1]?.createdAt : null,
+    });
   });
 
   app.post("/announcements", requireAuth, requireRole("admin"), rateLimit({ scope: "announcements.create", limit: 30, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
@@ -256,6 +443,7 @@ export function registerContentRoutes(app: Hono) {
     const body = publishSchema.parse(await c.req.json().catch(() => ({})));
     const [announcement] = await db.select().from(announcements).where(eq(announcements.id, id)).limit(1);
     if (!announcement || announcement.status === "deleted") fail("NOT_FOUND", "Announcement was not found.", 404);
+    if (!["draft", "scheduled"].includes(announcement.status)) fail("CONFLICT", "Only draft or scheduled announcements can be published.", 409);
 
     const now = new Date();
     if (body.scheduledFor) {
@@ -328,6 +516,16 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ ok: true });
   });
 
+  app.delete("/announcements/:id/reactions", requireAuth, requireRole("customer"), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const id = z.string().min(1).parse(c.req.param("id"));
+    const body = reactionSchema.parse(await c.req.json());
+    await db
+      .delete(announcementReactions)
+      .where(and(eq(announcementReactions.announcementId, id), eq(announcementReactions.userId, actor.id), eq(announcementReactions.emoji, body.emoji)));
+    return c.json({ ok: true });
+  });
+
   app.post("/announcements/:id/comments", requireAuth, requireRole("customer"), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
@@ -359,13 +557,24 @@ export function registerContentRoutes(app: Hono) {
     if (actor.role === "customer") filters.push(eq(reports.customerId, actor.id));
     if (query.cursor) filters.push(lt(reports.createdAt, query.cursor));
     const rows = await db.select().from(reports).where(filters.length ? and(...filters) : undefined).orderBy(desc(reports.createdAt)).limit(query.limit + 1);
-    const items = await Promise.all(
-      rows.slice(0, query.limit).map(async (report) => ({
-        ...report,
-        files: await reportFileRows(report.id),
-        availableActions: reportActions(actor.role),
-      })),
-    );
+    const page = rows.slice(0, query.limit);
+    const reportIds = page.map((row) => row.id);
+    const fileLinks = reportIds.length ? await db.select().from(reportFiles).where(inArray(reportFiles.reportId, reportIds)) : [];
+    const fileRows = fileLinks.length ? await db.select().from(files).where(inArray(files.id, fileLinks.map((l) => l.fileId))) : [];
+    const filesById = new Map(fileRows.map((f) => [f.id, f]));
+    const filesByReport = new Map<string, typeof fileRows>();
+    for (const link of fileLinks) {
+      const file = filesById.get(link.fileId);
+      if (!file) continue;
+      const arr = filesByReport.get(link.reportId) ?? [];
+      arr.push(file);
+      filesByReport.set(link.reportId, arr);
+    }
+    const items = page.map((report) => ({
+      ...report,
+      files: filesByReport.get(report.id) ?? [],
+      availableActions: reportActions(actor.role),
+    }));
     return c.json({ items, nextCursor: rows.length > query.limit ? rows[query.limit - 1]?.createdAt : null });
   });
 
@@ -397,8 +606,13 @@ export function registerContentRoutes(app: Hono) {
       const id = randomUUID();
       await assertAttachableFiles(actor.id, body.fileIds, "report", id);
       const evidenceSnapshot = body.evidenceMessageIds?.length
-        ? await db.select({ id: messages.id, body: messages.body, createdAt: messages.createdAt }).from(messages).where(inArray(messages.id, body.evidenceMessageIds))
+        ? await db
+            .select({ id: messages.id, body: messages.body, createdAt: messages.createdAt })
+            .from(messages)
+            .innerJoin(supportChats, eq(messages.chatId, supportChats.id))
+            .where(and(inArray(messages.id, body.evidenceMessageIds), eq(supportChats.customerId, actor.id), eq(messages.visibleToCustomer, true)))
         : [];
+      if ((body.evidenceMessageIds?.length ?? 0) !== evidenceSnapshot.length) fail("FORBIDDEN", "One or more evidence messages are not available.", 403);
       await db.transaction(async (tx) => {
         await tx.insert(reports).values({
           id,
@@ -412,6 +626,19 @@ export function registerContentRoutes(app: Hono) {
         for (const fileId of body.fileIds ?? []) {
           await tx.update(files).set({ resourceType: "report", resourceId: id }).where(eq(files.id, fileId));
           await tx.insert(reportFiles).values({ reportId: id, fileId }).onConflictDoNothing();
+        }
+        const admins = await tx.select({ id: users.id }).from(users).where(and(eq(users.role, "admin"), eq(users.status, "active")));
+        for (const admin of admins) {
+          await tx.insert(notifications).values({
+            id: randomUUID(),
+            userId: admin.id,
+            type: "report_created",
+            resourceType: "report",
+            resourceId: id,
+            title: "New report",
+            body: body.title,
+            dedupeKey: `report-created:${id}:${admin.id}`,
+          }).onConflictDoNothing();
         }
       });
       await publishEvent([adminChannel], "notification:new", { resourceId: id, resourceType: "report" });
@@ -427,10 +654,32 @@ export function registerContentRoutes(app: Hono) {
     const body = reportStatusSchema.parse(await c.req.json());
     const [report] = await db.select().from(reports).where(eq(reports.id, id)).limit(1);
     if (!report) fail("NOT_FOUND", "Report was not found.", 404);
-    await db.update(reports).set({ status: body.status, adminNotes: body.adminNotes, updatedAt: new Date().toISOString() }).where(eq(reports.id, id));
-    await audit(actor, "report_status_changed", "report", id, { from: report.status, to: body.status }, c.get("requestId"));
-    await db.insert(notifications).values({ id: randomUUID(), userId: report.customerId, type: "report_status_changed", resourceType: "report", resourceId: id, title: "Report updated", body: `Your report is now ${body.status}.` });
-    await publishEvent([userChannel(report.customerId), adminChannel], "report:status_updated", { resourceId: id, reportId: id, status: body.status, actor });
+    if (report.status === body.status && (body.adminNotes === undefined || body.adminNotes === report.adminNotes)) {
+      return c.json({ report });
+    }
+    await db.update(reports).set({ status: body.status, ...(body.adminNotes !== undefined ? { adminNotes: body.adminNotes } : {}), updatedAt: new Date().toISOString() }).where(eq(reports.id, id));
+    const statusChanged = report.status !== body.status;
+    if (statusChanged) {
+      await audit(actor, "report_status_changed", "report", id, { from: report.status, to: body.status }, c.get("requestId"));
+      await db
+        .insert(notifications)
+        .values({
+          id: randomUUID(),
+          userId: report.customerId,
+          type: "report_status_changed",
+          resourceType: "report",
+          resourceId: id,
+          title: "Report updated",
+          body: `Your report is now ${body.status}.`,
+          dedupeKey: `report-status:${id}:${body.status}`,
+        })
+        .onConflictDoNothing();
+      const [customer] = await db.select({ email: users.email, status: users.status }).from(users).where(eq(users.id, report.customerId)).limit(1);
+      if (customer && customer.status === "active") {
+        await sendReportStatusChanged(customer.email, body.status, id).catch((error) => console.error("report status email failed", error));
+      }
+      await publishEvent([userChannel(report.customerId), adminChannel], "report:status_updated", { resourceId: id, reportId: id, status: body.status, actor });
+    }
     const [updated] = await db.select().from(reports).where(eq(reports.id, id)).limit(1);
     return c.json({ report: updated });
   });
@@ -481,7 +730,20 @@ export function registerContentRoutes(app: Hono) {
       .where(and(isNull(teamMessages.deletedAt), query.cursor ? lt(teamMessages.createdAt, query.cursor) : undefined))
       .orderBy(desc(teamMessages.createdAt))
       .limit(query.limit + 1);
-    const items = await Promise.all(rows.slice(0, query.limit).map(async (message) => ({ ...message, files: await teamMessageFileRows(message.id) })));
+    const page = rows.slice(0, query.limit);
+    const messageIds = page.map((m) => m.id);
+    const fileLinks = messageIds.length ? await db.select().from(teamMessageFiles).where(inArray(teamMessageFiles.messageId, messageIds)) : [];
+    const fileRows = fileLinks.length ? await db.select().from(files).where(inArray(files.id, fileLinks.map((l) => l.fileId))) : [];
+    const filesById = new Map(fileRows.map((f) => [f.id, f]));
+    const filesByMessage = new Map<string, typeof fileRows>();
+    for (const link of fileLinks) {
+      const file = filesById.get(link.fileId);
+      if (!file) continue;
+      const arr = filesByMessage.get(link.messageId) ?? [];
+      arr.push(file);
+      filesByMessage.set(link.messageId, arr);
+    }
+    const items = page.map((message) => ({ ...message, files: filesByMessage.get(message.id) ?? [] }));
     return c.json({ items, nextCursor: rows.length > query.limit ? rows[query.limit - 1]?.createdAt : null, unreadCount: await teamUnreadCount(actor.id) });
   });
 
@@ -518,13 +780,19 @@ export function registerContentRoutes(app: Hono) {
     const actor = c.get("actor");
     const body = teamReadSchema.parse(await c.req.json().catch(() => ({})));
     const [latest] = body.messageId
-      ? await db.select().from(teamMessages).where(eq(teamMessages.id, body.messageId)).limit(1)
+      ? await db.select().from(teamMessages).where(and(eq(teamMessages.id, body.messageId), isNull(teamMessages.deletedAt))).limit(1)
       : await db.select().from(teamMessages).where(isNull(teamMessages.deletedAt)).orderBy(desc(teamMessages.createdAt)).limit(1);
     if (!latest) return c.json({ ok: true, unreadCount: 0 });
-    await db.insert(teamMessageReads).values({ messageId: latest.id, userId: actor.id }).onConflictDoUpdate({
-      target: [teamMessageReads.messageId, teamMessageReads.userId],
-      set: { readAt: new Date().toISOString() },
-    });
+    const rowsToMark = await db
+      .select({ id: teamMessages.id })
+      .from(teamMessages)
+      .where(and(isNull(teamMessages.deletedAt), ne(teamMessages.senderId, actor.id), sql`${teamMessages.createdAt} <= ${latest.createdAt}`));
+    for (const row of rowsToMark) {
+      await db.insert(teamMessageReads).values({ messageId: row.id, userId: actor.id }).onConflictDoUpdate({
+        target: [teamMessageReads.messageId, teamMessageReads.userId],
+        set: { readAt: new Date().toISOString() },
+      });
+    }
     return c.json({ ok: true, unreadCount: await teamUnreadCount(actor.id) });
   });
 
@@ -550,11 +818,11 @@ export function registerContentRoutes(app: Hono) {
       action ? eq(auditLogs.action, action) : undefined,
       resourceType ? eq(auditLogs.resourceType, resourceType) : undefined,
       actorId ? eq(auditLogs.actorId, actorId) : undefined,
-    ];
+    ].filter(Boolean) as ReturnType<typeof eq>[];
     const rows = await db
       .select()
       .from(auditLogs)
-      .where(and(...filters))
+      .where(filters.length ? and(...filters) : undefined)
       .orderBy(desc(auditLogs.createdAt))
       .limit(query.limit + 1);
     return c.json({ items: rows.slice(0, query.limit), nextCursor: rows.length > query.limit ? rows[query.limit - 1]?.createdAt : null });

@@ -38,6 +38,10 @@ export const config = envSchema.parse(process.env);
 
 export const isProduction = config.NODE_ENV === "production";
 
+if (isProduction && !config.CORS_ORIGIN) {
+  throw new Error("CORS_ORIGIN must be set when NODE_ENV=production.");
+}
+
 export const fileConfig = {
   maxBytes: 10 * 1024 * 1024,
   allowedTypes: [

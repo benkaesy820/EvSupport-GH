@@ -3,7 +3,7 @@ import type { Hono } from "hono";
 import { requireAuth, type Actor, type AppContext } from "./security.js";
 import { db } from "./db.js";
 import { count, eq, isNull, and } from "drizzle-orm";
-import { notifications, outboxEvents } from "./schema.js";
+import { notifications } from "./schema.js";
 
 type EventPayload = {
   type: string;
@@ -18,9 +18,11 @@ type Client = {
   actor: Actor;
   channels: Set<string>;
   send: (event: string, data: EventPayload) => Promise<void>;
+  close: () => void;
 };
 
 const clients = new Map<string, Client>();
+const clientsByUser = new Map<string, Set<Client>>();
 
 export function userChannel(userId: string) {
   return `user:${userId}`;
@@ -41,17 +43,22 @@ export async function publishEvent(channels: string[], event: string, data: Omit
   };
 
   const uniqueChannels = new Set(channels);
-  await db.insert(outboxEvents).values({
-    id: crypto.randomUUID(),
-    event,
-    channels: JSON.stringify([...uniqueChannels]),
-    payload: JSON.stringify(payload),
-  });
-  await Promise.all(
-    [...clients.values()]
-      .filter((client) => [...uniqueChannels].some((channel) => client.channels.has(channel)))
-      .map((client) => client.send(event, payload).catch(() => undefined)),
+  const targets = [...clients.values()].filter((client) =>
+    [...uniqueChannels].some((channel) => client.channels.has(channel)),
   );
+
+  await Promise.all(targets.map((client) => client.send(event, payload).catch(() => undefined)));
+
+  if (event === "force:logout") {
+    const scopedSessionId = typeof payload.sessionId === "string" ? payload.sessionId : null;
+    for (const target of targets) {
+      if (!scopedSessionId || target.actor.sessionId === scopedSessionId) target.close();
+    }
+  }
+}
+
+export function closeAllStreams() {
+  for (const client of clients.values()) client.close();
 }
 
 function channelsFor(actor: Actor) {
@@ -59,6 +66,21 @@ function channelsFor(actor: Actor) {
   if (actor.role === "admin") channels.add(adminChannel);
   if (actor.role === "admin" || actor.role === "agent") channels.add(teamChannel);
   return channels;
+}
+
+function trackClient(client: Client) {
+  clients.set(client.id, client);
+  const bucket = clientsByUser.get(client.actor.id) ?? new Set<Client>();
+  bucket.add(client);
+  clientsByUser.set(client.actor.id, bucket);
+}
+
+function untrackClient(client: Client) {
+  clients.delete(client.id);
+  const bucket = clientsByUser.get(client.actor.id);
+  if (!bucket) return;
+  bucket.delete(client);
+  if (!bucket.size) clientsByUser.delete(client.actor.id);
 }
 
 export function registerEventRoutes(app: Hono) {
@@ -79,14 +101,20 @@ export function registerEventRoutes(app: Hono) {
 
     return streamSSE(c, async (stream) => {
       const clientId = crypto.randomUUID();
+      let closed = false;
       const client: Client = {
         id: clientId,
         actor,
         channels: channelsFor(actor),
         send: (event, data) => stream.writeSSE({ event, data: JSON.stringify(data), id: crypto.randomUUID() }),
+        close: () => {
+          if (closed) return;
+          closed = true;
+          stream.abort();
+        },
       };
 
-      clients.set(clientId, client);
+      trackClient(client);
       await stream.writeSSE({
         event: "connected",
         data: JSON.stringify({ type: "connected", createdAt: new Date().toISOString() }),
@@ -99,10 +127,10 @@ export function registerEventRoutes(app: Hono) {
 
       stream.onAbort(() => {
         clearInterval(keepAlive);
-        clients.delete(clientId);
+        untrackClient(client);
       });
 
-      while (!stream.aborted) {
+      while (!stream.aborted && !closed) {
         await stream.sleep(60_000);
       }
     });

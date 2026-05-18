@@ -3,14 +3,16 @@ import { hash, verify } from "@node-rs/argon2";
 import { Hono } from "hono";
 import { getCookie, deleteCookie } from "hono/cookie";
 import { jwtVerify } from "jose";
-import { and, count, desc, eq, gt, gte, isNull, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, gte, inArray, isNull, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db.js";
-import { agents, customers, notifications, passwordResetTokens, supportChats, teamMessages, twoFactorChallenges, userSessions, users } from "./schema.js";
+import { agents, chatAssignments, customers, files, notifications, passwordResetTokens, reports, supportChats, systemSettings, teamMessages, twoFactorChallenges, userSessions, users } from "./schema.js";
 import { audit, actorKey, fail, hashToken, ipKey, rateLimit, requireAuth, requireRole, setAuthCookies, signAccessToken, signRefreshToken, type Actor, type AppContext } from "./security.js";
 import { config, isProduction } from "./config.js";
 import { adminChannel, publishEvent, userChannel } from "./events.js";
-import { sendCustomerInvite, sendNewAccountEmail, sendPasswordReset, sendSecurityAlert, sendTwoFactorCode } from "./email.js";
+import { sendCustomerApproved, sendCustomerInvite, sendNewAccountEmail, sendPasswordReset, sendSecurityAlert, sendTwoFactorCode } from "./email.js";
+
+const DUMMY_HASH = "$argon2id$v=19$m=19456,t=2,p=1$YWFhYWFhYWFhYWFhYWFhYQ$WjwH7QmBzdwTjPzwhSk7p8RXLT8c1IhT2/wRBYpyu+E";
 
 const loginSchema = z.object({
   email: z.string().email().transform((v) => v.toLowerCase()),
@@ -55,7 +57,9 @@ const profileSchema = z.object({
   phone: z.string().max(50).nullable().optional(),
   timezone: z.string().min(1).max(80).optional(),
   notificationPrefs: z.record(z.boolean()).optional(),
+  avatarFileId: z.string().min(1).nullable().optional(),
 });
+const twoFactorDisableSchema = z.object({ password: z.string().min(1) });
 const adminUserPatchSchema = z.object({
   status: z.enum(["active", "suspended"]).optional(),
   displayName: z.string().min(1).max(120).optional(),
@@ -80,8 +84,11 @@ function publicUser(row: typeof users.$inferSelect) {
     role: row.role,
     email: row.email,
     displayName: row.displayName,
+    phone: row.phone,
+    avatarFileId: row.avatarFileId,
     status: row.status,
     timezone: row.timezone,
+    notificationPrefs: row.notificationPrefs,
     twoFactorEnabled: row.twoFactorEnabled,
   };
 }
@@ -146,6 +153,11 @@ async function createSession(c: AppContext, user: typeof users.$inferSelect) {
   return { accessToken, refreshToken, sessionId, expiresAt };
 }
 
+async function defaultChatPriority() {
+  const [setting] = await db.select().from(systemSettings).where(eq(systemSettings.key, "defaultChatPriority")).limit(1);
+  return setting?.value === "high" || setting?.value === "urgent" ? setting.value : "normal";
+}
+
 async function createTwoFactorChallenge(user: typeof users.$inferSelect) {
   const code = randomInt(100000, 1000000).toString();
   const challengeId = randomUUID();
@@ -197,7 +209,8 @@ export function registerAuthRoutes(app: Hono) {
     const body = loginSchema.parse(await c.req.json());
     const [user] = await db.select().from(users).where(eq(users.email, body.email)).limit(1);
 
-    if (!user || !(await verify(user.passwordHash, body.password))) {
+    const passwordOk = await verify(user?.passwordHash ?? DUMMY_HASH, body.password).catch(() => false);
+    if (!user || !passwordOk) {
       fail("UNAUTHORIZED", "Invalid email or password.", 401);
     }
     if (user.status === "pending_approval") fail("FORBIDDEN", "Your account is waiting for approval.", 403);
@@ -264,16 +277,30 @@ export function registerAuthRoutes(app: Hono) {
     const sessionId = String(verified?.payload.sessionId ?? "");
     if (!userId || !sessionId) fail("UNAUTHORIZED", "Invalid refresh token.", 401);
 
+    const nowIso = new Date().toISOString();
     const [row] = await db
       .select({ user: users, session: userSessions })
       .from(users)
       .innerJoin(userSessions, eq(userSessions.id, sessionId))
-      .where(and(eq(users.id, userId), eq(userSessions.refreshTokenHash, hashToken(refreshToken)), isNull(userSessions.revokedAt)))
+      .where(
+        and(
+          eq(users.id, userId),
+          eq(userSessions.refreshTokenHash, hashToken(refreshToken)),
+          isNull(userSessions.revokedAt),
+          gt(userSessions.expiresAt, nowIso),
+        ),
+      )
       .limit(1);
 
     if (!row || row.user.status !== "active") fail("UNAUTHORIZED", "Invalid refresh token.", 401);
+
+    const nextRefresh = await signRefreshToken(row.user.id, sessionId);
     const accessToken = await signAccessToken({ id: row.user.id, role: row.user.role }, sessionId);
-    setAuthCookies(c, accessToken, refreshToken);
+    await db
+      .update(userSessions)
+      .set({ refreshTokenHash: hashToken(nextRefresh) })
+      .where(eq(userSessions.id, sessionId));
+    setAuthCookies(c, accessToken, nextRefresh);
     return c.json({ user: publicUser(row.user), session: { accessToken } });
   });
 
@@ -338,24 +365,90 @@ export function registerAuthRoutes(app: Hono) {
             .where(
               and(
                 isNull(teamMessages.deletedAt),
-                sql`${teamMessages.senderId} is not ${actor.id}`,
+                ne(teamMessages.senderId, actor.id),
                 sql`not exists (select 1 from team_message_reads tmr where tmr.message_id = ${teamMessages.id} and tmr.user_id = ${actor.id})`,
               ),
             )
         : [{ value: 0 }];
-    return c.json({ user: publicUser(user), counts: { notificationsUnread: unread.value, teamUnread: teamUnread.value } });
+
+    const agentProfile =
+      actor.role === "agent"
+        ? (await db.select().from(agents).where(eq(agents.userId, actor.id)).limit(1))[0] ?? null
+        : null;
+
+    return c.json({
+      user: { ...publicUser(user), avatarFileId: user.avatarFileId, lastActiveAt: user.lastActiveAt, agent: agentProfile },
+      counts: { notificationsUnread: unread.value, teamUnread: teamUnread.value },
+    });
   });
 
   app.patch("/me", requireAuth, async (c: AppContext) => {
     const actor = c.get("actor");
     const body = profileSchema.parse(await c.req.json());
+    if (body.avatarFileId) {
+      const [file] = await db.select().from(files).where(eq(files.id, body.avatarFileId)).limit(1);
+      if (!file || file.ownerId !== actor.id) fail("FORBIDDEN", "You can only use your own files as an avatar.", 403);
+      if (file.status !== "ready") fail("CONFLICT", "Avatar file is not ready.", 409);
+    }
     await db.update(users).set({ ...body, updatedAt: new Date().toISOString() }).where(eq(users.id, actor.id));
     const [user] = await db.select().from(users).where(eq(users.id, actor.id)).limit(1);
     return c.json({ user: publicUser(user) });
   });
 
+  app.post("/me/2fa/enroll", requireAuth, rateLimit({ scope: "auth.2fa_enroll", limit: 5, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
+    const actor = c.get("actor");
+    if (actor.role === "admin") fail("CONFLICT", "Admin accounts already require two-factor authentication.", 409);
+    const [user] = await db.select().from(users).where(eq(users.id, actor.id)).limit(1);
+    if (!user) fail("UNAUTHORIZED", "User not found.", 401);
+    if (user.twoFactorEnabled) fail("CONFLICT", "Two-factor authentication is already enabled.", 409);
+    const challenge = await createTwoFactorChallenge(user);
+    return c.json({ challengeId: challenge.challengeId, debugCode: challenge.debugCode });
+  });
+
+  app.post("/me/2fa/enroll/verify", requireAuth, rateLimit({ scope: "auth.2fa_enroll_verify", limit: 10, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const body = twoFactorVerifySchema.parse(await c.req.json());
+    const [challenge] = await db
+      .select()
+      .from(twoFactorChallenges)
+      .where(and(eq(twoFactorChallenges.id, body.challengeId), eq(twoFactorChallenges.userId, actor.id), isNull(twoFactorChallenges.usedAt), gt(twoFactorChallenges.expiresAt, new Date().toISOString())))
+      .limit(1);
+    if (!challenge) fail("UNAUTHORIZED", "Invalid or expired verification code.", 401);
+    if (challenge.attempts >= 5) fail("RATE_LIMITED", "Too many verification attempts.", 429);
+    if (challenge.codeHash !== hashToken(body.code)) {
+      await db.update(twoFactorChallenges).set({ attempts: challenge.attempts + 1 }).where(eq(twoFactorChallenges.id, challenge.id));
+      fail("UNAUTHORIZED", "Invalid or expired verification code.", 401);
+    }
+    await db.transaction(async (tx) => {
+      await tx.update(users).set({ twoFactorEnabled: true, updatedAt: new Date().toISOString() }).where(eq(users.id, actor.id));
+      await tx.update(twoFactorChallenges).set({ usedAt: new Date().toISOString() }).where(eq(twoFactorChallenges.id, challenge.id));
+    });
+    await audit(actor, "two_factor_enabled", "user", actor.id, {}, c.get("requestId"));
+    return c.json({ ok: true, twoFactorEnabled: true });
+  });
+
+  app.post("/me/2fa/disable", requireAuth, rateLimit({ scope: "auth.2fa_disable", limit: 5, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
+    const actor = c.get("actor");
+    if (actor.role === "admin") fail("FORBIDDEN", "Admin accounts cannot disable two-factor authentication.", 403);
+    const body = twoFactorDisableSchema.parse(await c.req.json());
+    const [user] = await db.select().from(users).where(eq(users.id, actor.id)).limit(1);
+    if (!user) fail("UNAUTHORIZED", "User not found.", 401);
+    const passwordOk = await verify(user.passwordHash, body.password).catch(() => false);
+    if (!passwordOk) fail("UNAUTHORIZED", "Incorrect password.", 401);
+    await db.update(users).set({ twoFactorEnabled: false, updatedAt: new Date().toISOString() }).where(eq(users.id, actor.id));
+    await audit(actor, "two_factor_disabled", "user", actor.id, {}, c.get("requestId"));
+    return c.json({ ok: true, twoFactorEnabled: false });
+  });
+
   app.get("/sessions", requireAuth, async (c: AppContext) => {
     const actor = c.get("actor");
+    const includeRevoked = c.req.query("includeRevoked") === "true";
+    const nowIso = new Date().toISOString();
+    const filters = [eq(userSessions.userId, actor.id)];
+    if (!includeRevoked) {
+      filters.push(isNull(userSessions.revokedAt));
+      filters.push(gt(userSessions.expiresAt, nowIso));
+    }
     const rows = await db
       .select({
         id: userSessions.id,
@@ -365,7 +458,7 @@ export function registerAuthRoutes(app: Hono) {
         createdAt: userSessions.createdAt,
       })
       .from(userSessions)
-      .where(eq(userSessions.userId, actor.id))
+      .where(and(...filters))
       .orderBy(desc(userSessions.createdAt))
       .limit(100);
 
@@ -510,8 +603,12 @@ export function registerAuthRoutes(app: Hono) {
     if (!target) fail("NOT_FOUND", "User was not found.", 404);
     if (target.role !== "customer" || target.status !== "pending_approval") fail("CONFLICT", "Only pending customers can be approved.", 409);
 
-    await db.update(users).set({ status: "active", updatedAt: new Date().toISOString() }).where(eq(users.id, targetId));
+    await db.transaction(async (tx) => {
+      await tx.update(users).set({ status: "active", updatedAt: new Date().toISOString() }).where(eq(users.id, targetId));
+      await tx.insert(supportChats).values({ id: randomUUID(), customerId: targetId, priority: await defaultChatPriority() }).onConflictDoNothing();
+    });
     await audit(actor, "customer_approved", "user", targetId, {}, c.get("requestId"));
+    await sendCustomerApproved(target.email).catch((error) => console.error("customer approved email failed", error));
     const notificationId = randomUUID();
     await db.insert(notifications).values({
       id: notificationId,
@@ -538,7 +635,7 @@ export function registerAuthRoutes(app: Hono) {
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
     const [resolvedToday] = await db.select({ value: count() }).from(supportChats).where(and(eq(supportChats.status, "resolved"), gte(supportChats.updatedAt, today.toISOString())));
-    const [pendingReports] = await db.select({ value: count() }).from(notifications).where(and(eq(notifications.resourceType, "report"), isNull(notifications.readAt)));
+    const [pendingReports] = await db.select({ value: count() }).from(reports).where(eq(reports.status, "pending"));
     return c.json({
       counts: {
         openChats: open.value,
@@ -547,7 +644,7 @@ export function registerAuthRoutes(app: Hono) {
         resolvedToday: resolvedToday.value,
         activeAgents: activeAgents.value,
         pendingCustomers: pendingCustomers.value,
-        pendingReportNotifications: pendingReports.value,
+        pendingReports: pendingReports.value,
       },
     });
   });
@@ -566,6 +663,7 @@ export function registerAuthRoutes(app: Hono) {
         await tx.update(userSessions).set({ revokedAt: new Date().toISOString() }).where(and(eq(userSessions.userId, targetId), isNull(userSessions.revokedAt)));
         if (target.role === "agent") {
           await tx.update(supportChats).set({ assignedAgentId: null, updatedAt: new Date().toISOString() }).where(eq(supportChats.assignedAgentId, targetId));
+          await tx.update(chatAssignments).set({ endedAt: new Date().toISOString() }).where(and(eq(chatAssignments.agentId, targetId), isNull(chatAssignments.endedAt)));
         }
       }
     });
@@ -586,6 +684,8 @@ export function registerAuthRoutes(app: Hono) {
     if (targetId === actor.id) fail("CONFLICT", "Admins cannot anonymize themselves.", 409);
     const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
     if (!target) fail("NOT_FOUND", "User was not found.", 404);
+    if (target.status === "anonymized") fail("CONFLICT", "User is already anonymized.", 409);
+    const now = new Date().toISOString();
     await db.transaction(async (tx) => {
       await tx.update(users).set({
         email: `deleted-${targetId}@deleted.local`,
@@ -593,11 +693,24 @@ export function registerAuthRoutes(app: Hono) {
         phone: null,
         avatarFileId: null,
         status: "anonymized",
-        anonymizedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        anonymizedAt: now,
+        updatedAt: now,
       }).where(eq(users.id, targetId));
-      await tx.update(userSessions).set({ revokedAt: new Date().toISOString() }).where(and(eq(userSessions.userId, targetId), isNull(userSessions.revokedAt)));
-      if (target.role === "agent") await tx.update(supportChats).set({ assignedAgentId: null, updatedAt: new Date().toISOString() }).where(eq(supportChats.assignedAgentId, targetId));
+      await tx.update(userSessions).set({ revokedAt: now }).where(and(eq(userSessions.userId, targetId), isNull(userSessions.revokedAt)));
+      if (target.role === "agent") {
+        await tx.update(supportChats).set({ assignedAgentId: null, updatedAt: now }).where(eq(supportChats.assignedAgentId, targetId));
+        await tx.update(chatAssignments).set({ endedAt: now }).where(and(eq(chatAssignments.agentId, targetId), isNull(chatAssignments.endedAt)));
+      }
+      if (target.role === "customer") {
+        await tx.update(supportChats).set({ status: "closed", closedAt: now, updatedAt: now }).where(and(eq(supportChats.customerId, targetId), ne(supportChats.status, "closed")));
+        const targetChats = await tx.select({ id: supportChats.id }).from(supportChats).where(eq(supportChats.customerId, targetId));
+        if (targetChats.length) {
+          await tx
+            .update(chatAssignments)
+            .set({ endedAt: now })
+            .where(and(inArray(chatAssignments.chatId, targetChats.map((chat) => chat.id)), isNull(chatAssignments.endedAt)));
+        }
+      }
     });
     await audit(actor, "user_anonymized", "user", targetId, {}, c.get("requestId"));
     await publishEvent([userChannel(targetId)], "force:logout", { resourceId: targetId, reason: "user_anonymized" });

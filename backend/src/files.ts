@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import { PutObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Hono } from "hono";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { config, fileConfig, isProduction } from "./config.js";
 import { db } from "./db.js";
-import { announcementTargets, customers, files, supportChats, reports, announcements } from "./schema.js";
+import { announcementTargets, customers, files, supportChats, reports, announcements, systemSettings } from "./schema.js";
 import { actorKey, audit, fail, rateLimit, requireAuth, type Actor, type AppContext } from "./security.js";
 
 const uploadIntentSchema = z.object({
@@ -38,7 +38,8 @@ function s3Client() {
 }
 
 async function canAccessResource(actor: Actor, resourceType?: string | null, resourceId?: string | null) {
-  if (!resourceType || !resourceId) return true;
+  if (!resourceType && !resourceId) return true;
+  if (!resourceType || !resourceId) return false;
   if (actor.role === "admin") return true;
 
   if (resourceType === "team") return actor.role === "agent";
@@ -74,12 +75,28 @@ async function canAccessResource(actor: Actor, resourceType?: string | null, res
   return false;
 }
 
+async function currentFilePolicy() {
+  const rows = await db
+    .select()
+    .from(systemSettings)
+    .where(inArray(systemSettings.key, ["maxFileSize", "allowedFileTypes"]));
+  const settings = Object.fromEntries(rows.map((row) => [row.key, row.value]));
+  return {
+    maxBytes: typeof settings.maxFileSize === "number" ? settings.maxFileSize : fileConfig.maxBytes,
+    allowedTypes: Array.isArray(settings.allowedFileTypes) && settings.allowedFileTypes.every((value) => typeof value === "string")
+      ? settings.allowedFileTypes
+      : fileConfig.allowedTypes,
+  };
+}
+
 export function registerFileRoutes(app: Hono) {
   app.post("/files/upload-intents", requireAuth, rateLimit({ scope: "files.upload_intent", limit: 30, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = uploadIntentSchema.parse(await c.req.json());
-    if (!fileConfig.allowedTypes.includes(body.mimeType)) fail("VALIDATION_ERROR", "File type is not allowed.", 400);
-    if (body.sizeBytes > fileConfig.maxBytes) fail("VALIDATION_ERROR", "File exceeds the maximum allowed size.", 400);
+    if ((body.resourceType && !body.resourceId) || (!body.resourceType && body.resourceId)) fail("VALIDATION_ERROR", "resourceType and resourceId must be provided together.", 400);
+    const policy = await currentFilePolicy();
+    if (!policy.allowedTypes.includes(body.mimeType)) fail("VALIDATION_ERROR", "File type is not allowed.", 400);
+    if (body.sizeBytes > policy.maxBytes) fail("VALIDATION_ERROR", "File exceeds the maximum allowed size.", 400);
     if (!(await canAccessResource(actor, body.resourceType, body.resourceId))) fail("FORBIDDEN", "You cannot attach files to this resource.", 403);
 
     const id = randomUUID();
@@ -121,10 +138,12 @@ export function registerFileRoutes(app: Hono) {
       if (head.ContentType && head.ContentType !== file.mimeType) fail("CONFLICT", "Uploaded object type does not match the upload intent.", 409);
     }
 
-    await db
+    const updatedRows = await db
       .update(files)
       .set({ status: "ready", checksum: body.checksum, completedAt: new Date().toISOString() })
-      .where(and(eq(files.id, id), eq(files.status, "pending")));
+      .where(and(eq(files.id, id), eq(files.status, "pending")))
+      .returning({ id: files.id });
+    if (!updatedRows.length) fail("CONFLICT", "File upload is not pending.", 409);
     await audit(actor, "file_uploaded", "file", id, { resourceType: file.resourceType, resourceId: file.resourceId }, c.get("requestId"));
     const [updated] = await db.select().from(files).where(eq(files.id, id)).limit(1);
     return c.json({ file: updated });
@@ -135,6 +154,7 @@ export function registerFileRoutes(app: Hono) {
     const id = z.string().min(1).parse(c.req.param("id"));
     const [file] = await db.select().from(files).where(eq(files.id, id)).limit(1);
     if (!file || file.status !== "ready") fail("NOT_FOUND", "File was not found.", 404);
+    if (!file.resourceType && !file.resourceId && file.ownerId !== actor.id) fail("FORBIDDEN", "You cannot access this file.", 403);
     if (!(await canAccessResource(actor, file.resourceType, file.resourceId))) fail("FORBIDDEN", "You cannot access this file.", 403);
     const downloadUrl = await getSignedUrl(s3Client(), new GetObjectCommand({ Bucket: bucket(), Key: file.storageKey }), { expiresIn: 10 * 60 });
     return c.json({ downloadUrl });

@@ -3,7 +3,7 @@ import type { Context, MiddlewareHandler, Next } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import { jwtVerify, SignJWT } from "jose";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { ZodError } from "zod";
 import { db } from "./db.js";
 import { auditLogs, idempotencyKeys, rateLimitCounters, userSessions, users } from "./schema.js";
@@ -133,10 +133,22 @@ export async function readActor(c: AppContext): Promise<Actor | null> {
       .limit(1);
 
     if (!row || row.status !== "active") return null;
+    touchUserActivity(userId).catch(() => undefined);
     return { ...row, sessionId };
   } catch {
     return null;
   }
+}
+
+const ACTIVITY_TOUCH_INTERVAL_MS = 60_000;
+const lastTouchByUser = new Map<string, number>();
+
+async function touchUserActivity(userId: string) {
+  const now = Date.now();
+  const last = lastTouchByUser.get(userId) ?? 0;
+  if (now - last < ACTIVITY_TOUCH_INTERVAL_MS) return;
+  lastTouchByUser.set(userId, now);
+  await db.update(users).set({ lastActiveAt: new Date(now).toISOString() }).where(eq(users.id, userId));
 }
 
 export const requireAuth: MiddlewareHandler<Env> = async (c, next: Next) => {
@@ -226,25 +238,19 @@ export function rateLimit(policy: RateLimitPolicy): MiddlewareHandler {
     const expiresAt = new Date(new Date(start).getTime() + policy.windowSeconds * 1000).toISOString();
 
     const [row] = await db
-      .select()
-      .from(rateLimitCounters)
-      .where(and(eq(rateLimitCounters.scope, policy.scope), eq(rateLimitCounters.key, key), eq(rateLimitCounters.windowStart, start)))
-      .limit(1);
+      .insert(rateLimitCounters)
+      .values({ scope: policy.scope, key, windowStart: start, count: 1, expiresAt })
+      .onConflictDoUpdate({
+        target: [rateLimitCounters.scope, rateLimitCounters.key, rateLimitCounters.windowStart],
+        set: { count: sql`${rateLimitCounters.count} + 1` },
+      })
+      .returning({ count: rateLimitCounters.count, expiresAt: rateLimitCounters.expiresAt });
 
-    if (row && row.count >= policy.limit) {
+    if (row && row.count > policy.limit) {
       fail("RATE_LIMITED", "Too many requests. Please try again later.", 429, {
         scope: policy.scope,
         retryAfterSeconds: Math.max(1, Math.ceil((new Date(row.expiresAt).getTime() - Date.now()) / 1000)),
       });
-    }
-
-    if (row) {
-      await db
-        .update(rateLimitCounters)
-        .set({ count: row.count + 1 })
-        .where(and(eq(rateLimitCounters.scope, policy.scope), eq(rateLimitCounters.key, key), eq(rateLimitCounters.windowStart, start)));
-    } else {
-      await db.insert(rateLimitCounters).values({ scope: policy.scope, key, windowStart: start, count: 1, expiresAt });
     }
 
     await next();

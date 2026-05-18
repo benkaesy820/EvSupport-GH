@@ -159,8 +159,8 @@ test("auth sessions, suspension, reset, and force logout are enforced", async ()
   const resetPassword = `Reset-${randomUUID()}-123!`;
   await apiRequest("POST", "/auth/password-reset/confirm", { token: reset.debugToken, password: resetPassword });
 
-  const forceLogoutEvents = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.event, "force:logout"));
-  assert.ok(forceLogoutEvents.length >= 1);
+  const resetAudits = await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.action, "password_reset"));
+  assert.ok(resetAudits.length >= 1);
 
   await admin.request("PATCH", `/admin/users/${customer.id}`, { status: "suspended" });
   await apiRequest("POST", "/auth/login", { email: customer.email, password: resetPassword }, 403);
@@ -209,10 +209,10 @@ test("customer registration, customer invite, approval, and admin creation restr
 
   const audit = await admin.request<{ items: Array<{ action: string }> }>("GET", "/admin/audit-logs?action=customer_approved");
   assert.ok(audit.items.some((item) => item.action === "customer_approved"));
-  const pendingEvents = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.event, "customer:pending_approval"));
-  const approvedEvents = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.event, "customer:approved"));
-  assert.ok(pendingEvents.length >= 2);
-  assert.ok(approvedEvents.length >= 2);
+  const inviteAudits = await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.action, "customer_invited"));
+  const registerAudits = await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.action, "customer_registered"));
+  assert.ok(inviteAudits.length >= 1);
+  assert.ok(registerAudits.length >= 1);
 });
 
 test("chat permissions, state transitions, unread counts, notes, and idempotency work", async () => {
@@ -293,6 +293,46 @@ test("file access follows parent resources and owner attachment rules", async ()
   await customerAClient.request("POST", `/chats/${chat.id}/messages`, { body: "bad file", fileIds: [otherFile] }, 403);
 });
 
+test("file intents enforce settings, resource pairing, owner-only unattached downloads, and pending completion", async () => {
+  const customerA = await createUser(admin, "customer", "file-policy-a");
+  const customerB = await createUser(admin, "customer", "file-policy-b");
+  const customerAClient = await login(customerA.email, customerA.password);
+  const customerBClient = await login(customerB.email, customerB.password);
+
+  await admin.request("PATCH", "/admin/settings", { maxFileSize: 64, allowedFileTypes: ["image/png"] });
+  await customerAClient.request("POST", "/files/upload-intents", {
+    resourceType: "chat",
+    name: "partial.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+  }, 400);
+  await customerAClient.request("POST", "/files/upload-intents", {
+    name: "too-large.png",
+    mimeType: "image/png",
+    sizeBytes: 128,
+  }, 400);
+  await customerAClient.request("POST", "/files/upload-intents", {
+    name: "bad.pdf",
+    mimeType: "application/pdf",
+    sizeBytes: 32,
+  }, 400);
+
+  const unattached = await createReadyFile(customerA.id);
+  await customerBClient.request("GET", `/files/${unattached}/download`, undefined, 403);
+
+  const expired = randomUUID();
+  await db.insert(schema.files).values({
+    id: expired,
+    ownerId: customerA.id,
+    storageKey: `${customerA.id}/${expired}/expired.png`,
+    name: "expired.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+    status: "expired",
+  });
+  await customerAClient.request("POST", `/files/${expired}/complete`, {}, 409);
+});
+
 test("announcements enforce schedule, targeting, reactions, comments, and counts", async () => {
   const vip = await createUser(admin, "customer", "vip-target");
   const regular = await createUser(admin, "customer", "regular-target");
@@ -342,6 +382,8 @@ test("reports preserve evidence, enforce visibility, and notify on status update
     fileIds: [reportFile],
     idempotencyKey: "report-idem-1",
   }, 201);
+  const adminReportNotifications = await db.select().from(schema.notifications).where(and(eq(schema.notifications.userId, adminSeed.id), eq(schema.notifications.type, "report_created")));
+  assert.ok(adminReportNotifications.some((item) => item.resourceId === report.report.id));
 
   await otherClient.request("GET", `/reports/${report.report.id}`, undefined, 403);
   const detail = await admin.request<{ report: { evidenceSnapshot: Array<{ body: string }>; files: unknown[]; availableActions: { update_status: boolean } } }>("GET", `/reports/${report.report.id}`);
@@ -356,6 +398,26 @@ test("reports preserve evidence, enforce visibility, and notify on status update
   await admin.request("PATCH", `/reports/${report.report.id}/status`, { status: "reviewed" });
   const notifications = await customerClient.request<{ unreadCount: number; items: Array<{ type: string }> }>("GET", "/notifications");
   assert.ok(notifications.items.some((item) => item.type === "report_status_changed"));
+});
+
+test("report evidence is limited to the reporting customer's visible messages", async () => {
+  const customerA = await createUser(admin, "customer", "evidence-a");
+  const customerB = await createUser(admin, "customer", "evidence-b");
+  const clientA = await login(customerA.email, customerA.password);
+  const clientB = await login(customerB.email, customerB.password);
+  const chatB = await clientB.request<{ chat: { id: string } }>("POST", "/chats/current");
+  const messageB = await clientB.request<{ message: { id: string } }>("POST", `/chats/${chatB.chat.id}/messages`, {
+    body: "not your evidence",
+    idempotencyKey: "foreign-evidence-message",
+  }, 201);
+
+  await clientA.request("POST", "/reports", {
+    title: "Bad evidence",
+    category: "bug",
+    description: "Should be rejected",
+    evidenceMessageIds: [messageB.message.id],
+    idempotencyKey: "foreign-evidence-report",
+  }, 403);
 });
 
 test("ratings are resolved-only and unique per support cycle", async () => {
@@ -390,8 +452,8 @@ test("team chat supports mentions, unread counts, read receipts, delete rules, a
   await agentBClient.request("POST", "/team/messages/read", { messageId: message.message.id });
   await agentBClient.request("DELETE", `/team/messages/${message.message.id}`, undefined, 403);
   await admin.request("DELETE", `/team/messages/${message.message.id}`);
-  const event = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.event, "team:message:deleted"));
-  assert.ok(event.length >= 1);
+  const teamDeleteAudits = await db.select().from(schema.auditLogs).where(eq(schema.auditLogs.action, "team_message_deleted"));
+  assert.ok(teamDeleteAudits.length >= 1);
 });
 
 test("search, audit filters, notifications, and SSE reconnect state are role-aware", async () => {
@@ -426,7 +488,7 @@ test("search, audit filters, notifications, and SSE reconnect state are role-awa
 test("database invariants and migration-created tables exist", async () => {
   const tables = await client.execute("select name from sqlite_master where type='table'");
   const tableNames = new Set(tables.rows.map((row) => row.name));
-  for (const table of ["users", "support_chats", "outbox_events", "idempotency_keys", "team_message_reads"]) {
+  for (const table of ["users", "support_chats", "idempotency_keys", "team_message_reads", "two_factor_challenges"]) {
     assert.ok(tableNames.has(table), `${table} should exist`);
   }
 
@@ -443,4 +505,221 @@ test("database invariants and migration-created tables exist", async () => {
 
   const activeAssignments = await db.select().from(schema.chatAssignments).where(isNull(schema.chatAssignments.endedAt));
   assert.ok(Array.isArray(activeAssignments));
+});
+
+test("optional 2FA enrollment and disable flow works for agents", async () => {
+  const agent = await createUser(admin, "agent", "twofa");
+  let agentClient = await login(agent.email, agent.password);
+
+  const enroll = await agentClient.request<{ challengeId: string; debugCode: string }>("POST", "/me/2fa/enroll");
+  assert.ok(enroll.challengeId);
+  assert.ok(enroll.debugCode);
+  await agentClient.request("POST", "/me/2fa/enroll/verify", { challengeId: enroll.challengeId, code: enroll.debugCode });
+
+  const me = await agentClient.request<{ user: { twoFactorEnabled: boolean } }>("GET", "/me");
+  assert.equal(me.user.twoFactorEnabled, true);
+
+  agentClient = await login(agent.email, agent.password);
+  const meAfter = await agentClient.request<{ user: { twoFactorEnabled: boolean } }>("GET", "/me");
+  assert.equal(meAfter.user.twoFactorEnabled, true);
+
+  await agentClient.request("POST", "/me/2fa/disable", { password: agent.password });
+  const meDisabled = await agentClient.request<{ user: { twoFactorEnabled: boolean } }>("GET", "/me");
+  assert.equal(meDisabled.user.twoFactorEnabled, false);
+
+  await agentClient.request("POST", "/me/2fa/disable", { password: "wrong-password" }, 401);
+});
+
+test("/customers/:id scopes agent access via current chat", async () => {
+  const agentA = await createUser(admin, "agent", "scopeA");
+  const agentB = await createUser(admin, "agent", "scopeB");
+  const customer = await createUser(admin, "customer", "scoped");
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current", undefined, 200);
+
+  const agentAClient = await login(agentA.email, agentA.password);
+  const agentBClient = await login(agentB.email, agentB.password);
+
+  await agentAClient.request("GET", `/customers/${customer.id}`);
+  await agentBClient.request("GET", `/customers/${customer.id}`);
+
+  await agentAClient.request("POST", `/chats/${current.chat.id}/claim`);
+  await agentAClient.request("GET", `/customers/${customer.id}`);
+  await agentBClient.request("GET", `/customers/${customer.id}`, undefined, 403);
+
+  await admin.request("GET", `/customers/${customer.id}`);
+});
+
+test("inbox filter aliases respect role visibility", async () => {
+  const agent = await createUser(admin, "agent", "inbox");
+  const customer = await createUser(admin, "customer", "inbox");
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+  const agentClient = await login(agent.email, agent.password);
+
+  const unassignedBefore = await agentClient.request<{ items: Array<{ id: string }> }>("GET", "/chats?filter=unassigned");
+  assert.ok(unassignedBefore.items.some((row) => row.id === current.chat.id));
+  const mineBefore = await agentClient.request<{ items: Array<{ id: string }> }>("GET", "/chats?filter=mine");
+  assert.ok(!mineBefore.items.some((row) => row.id === current.chat.id));
+
+  await agentClient.request("POST", `/chats/${current.chat.id}/claim`);
+  const unassignedAfter = await agentClient.request<{ items: Array<{ id: string }> }>("GET", "/chats?filter=unassigned");
+  assert.ok(!unassignedAfter.items.some((row) => row.id === current.chat.id));
+  const mineAfter = await agentClient.request<{ items: Array<{ id: string }> }>("GET", "/chats?filter=mine");
+  assert.ok(mineAfter.items.some((row) => row.id === current.chat.id));
+
+  await agentClient.request("GET", "/chats?filter=bogus", undefined, 400);
+  await agentClient.request("GET", "/chats?status=bogus", undefined, 400);
+  await agentClient.request("GET", "/chats?limit=not-a-number", undefined, 400);
+});
+
+test("chat read marks all prior visible unread messages", async () => {
+  const agent = await createUser(admin, "agent", "readbulk");
+  const customer = await createUser(admin, "customer", "readbulk");
+  const agentClient = await login(agent.email, agent.password);
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+  await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "one", idempotencyKey: "read-one" }, 201);
+  await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "two", idempotencyKey: "read-two" }, 201);
+  const latest = await customerClient.request<{ message: { id: string } }>("POST", `/chats/${current.chat.id}/messages`, { body: "three", idempotencyKey: "read-three" }, 201);
+  await agentClient.request("POST", `/chats/${current.chat.id}/claim`);
+
+  const before = await agentClient.request<{ chat: { unreadCount: number } }>("GET", `/chats/${current.chat.id}`);
+  assert.equal(before.chat.unreadCount, 3);
+  await agentClient.request("POST", `/chats/${current.chat.id}/read`, { messageId: latest.message.id });
+  const after = await agentClient.request<{ chat: { unreadCount: number } }>("GET", `/chats/${current.chat.id}`);
+  assert.equal(after.chat.unreadCount, 0);
+});
+
+test("announcement reactions toggle on and off", async () => {
+  const customer = await createUser(admin, "customer", "reactions");
+  const customerClient = await login(customer.email, customer.password);
+  const announcement = await admin.request<{ announcement: { id: string } }>("POST", "/announcements", {
+    title: "React me",
+    body: "body",
+    targetType: "all_customers",
+  }, 201);
+  await admin.request("POST", `/announcements/${announcement.announcement.id}/publish`, {});
+  await customerClient.request("POST", `/announcements/${announcement.announcement.id}/reactions`, { emoji: "thumbs_up" });
+  const detail = await customerClient.request<{ announcement: { reactionCounts: Record<string, number> } }>("GET", `/announcements/${announcement.announcement.id}`);
+  assert.equal(detail.announcement.reactionCounts.thumbs_up, 1);
+  await customerClient.request("DELETE", `/announcements/${announcement.announcement.id}/reactions`, { emoji: "thumbs_up" });
+  const detailAfter = await customerClient.request<{ announcement: { reactionCounts: Record<string, number> } }>("GET", `/announcements/${announcement.announcement.id}`);
+  assert.equal(detailAfter.announcement.reactionCounts.thumbs_up ?? 0, 0);
+});
+
+test("announcements cannot be published repeatedly", async () => {
+  const announcement = await admin.request<{ announcement: { id: string } }>("POST", "/announcements", {
+    title: "Publish once",
+    body: "body",
+    targetType: "all_customers",
+  }, 201);
+  await admin.request("POST", `/announcements/${announcement.announcement.id}/publish`, {});
+  await admin.request("POST", `/announcements/${announcement.announcement.id}/publish`, {}, 409);
+});
+
+test("announcement comments listing returns author summaries", async () => {
+  const customer = await createUser(admin, "customer", "comments");
+  const customerClient = await login(customer.email, customer.password);
+  const announcement = await admin.request<{ announcement: { id: string } }>("POST", "/announcements", {
+    title: "Talk to me",
+    body: "body",
+    targetType: "all_customers",
+  }, 201);
+  await admin.request("POST", `/announcements/${announcement.announcement.id}/publish`, {});
+  await customerClient.request("POST", `/announcements/${announcement.announcement.id}/comments`, { body: "first comment" }, 201);
+  const list = await customerClient.request<{ items: Array<{ body: string; author: { displayName: string } | null }> }>("GET", `/announcements/${announcement.announcement.id}/comments`);
+  assert.equal(list.items.length, 1);
+  assert.equal(list.items[0].body, "first comment");
+  assert.ok(list.items[0].author?.displayName);
+});
+
+test("customer auto-chat created on approval and sender info enriched", async () => {
+  const suffix = randomUUID().slice(0, 8);
+  const email = `approved-${suffix}@evcomm.test`;
+  const password = `Approved-${suffix}-Password-123!`;
+  const registered = await apiRequest<{ user: { id: string } }>("POST", "/auth/register", {
+    email,
+    password,
+    displayName: "Approved Customer",
+  }, 201);
+  await admin.request("POST", `/admin/users/${registered.user.id}/approve`);
+
+  const chats = await db.select().from(schema.supportChats).where(eq(schema.supportChats.customerId, registered.user.id));
+  assert.equal(chats.length, 1);
+
+  const customerClient = await login(email, password);
+  await customerClient.request("POST", `/chats/${chats[0].id}/messages`, { body: "auto-chat works", idempotencyKey: `auto-${suffix}` }, 201);
+  const detail = await customerClient.request<{ messages: Array<{ sender: { displayName: string; role: string } | null }> }>("GET", `/chats/${chats[0].id}`);
+  assert.ok(detail.messages.length >= 1);
+  assert.ok(detail.messages[0].sender);
+  assert.equal(detail.messages[0].sender?.role, "customer");
+});
+
+test("chat resolved is idempotent and closing ends open assignment", async () => {
+  const agent = await createUser(admin, "agent", "resolveidem");
+  const customer = await createUser(admin, "customer", "resolveidem");
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+  const agentClient = await login(agent.email, agent.password);
+  await agentClient.request("POST", `/chats/${current.chat.id}/claim`);
+  await agentClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "ok", idempotencyKey: `res-${randomUUID()}` }, 201);
+
+  const customerNotifsBefore = await db
+    .select()
+    .from(schema.notifications)
+    .where(and(eq(schema.notifications.userId, customer.id), eq(schema.notifications.type, "chat_resolved")));
+  await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
+  await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
+  const customerNotifsAfter = await db
+    .select()
+    .from(schema.notifications)
+    .where(and(eq(schema.notifications.userId, customer.id), eq(schema.notifications.type, "chat_resolved")));
+  assert.equal(customerNotifsAfter.length, customerNotifsBefore.length + 1);
+
+  await admin.request("POST", `/chats/${current.chat.id}/status`, { status: "closed" });
+  const openAssignments = await db
+    .select()
+    .from(schema.chatAssignments)
+    .where(and(eq(schema.chatAssignments.chatId, current.chat.id), isNull(schema.chatAssignments.endedAt)));
+  assert.equal(openAssignments.length, 0);
+});
+
+test("/sessions filters revoked by default", async () => {
+  const agent = await createUser(admin, "agent", "sessions");
+  const first = await login(agent.email, agent.password);
+  const second = await login(agent.email, agent.password);
+  const beforeRevoke = await second.request<{ items: Array<{ id: string; current: boolean }> }>("GET", "/sessions");
+  assert.ok(beforeRevoke.items.length >= 2);
+  const otherSession = beforeRevoke.items.find((row) => !row.current);
+  assert.ok(otherSession);
+  await second.request("DELETE", `/sessions/${otherSession!.id}`);
+  const afterRevoke = await second.request<{ items: Array<{ id: string }> }>("GET", "/sessions");
+  assert.ok(!afterRevoke.items.some((row) => row.id === otherSession!.id));
+  const withRevoked = await second.request<{ items: Array<{ id: string }> }>("GET", "/sessions?includeRevoked=true");
+  assert.ok(withRevoked.items.some((row) => row.id === otherSession!.id));
+  assert.ok(first);
+});
+
+test("settings drive default chat priority and reject unknown keys", async () => {
+  await admin.request("PATCH", "/admin/settings", { defaultChatPriority: "urgent" });
+  await admin.request("PATCH", "/admin/settings", { quickReplies: ["not here"] }, 400);
+  const customer = await createUser(admin, "customer", "default-priority");
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { priority: string } }>("POST", "/chats/current");
+  assert.equal(current.chat.priority, "urgent");
+});
+
+test("team read marks all prior unread messages", async () => {
+  const agentA = await createUser(admin, "agent", "team-read-a");
+  const agentB = await createUser(admin, "agent", "team-read-b");
+  const agentAClient = await login(agentA.email, agentA.password);
+  const agentBClient = await login(agentB.email, agentB.password);
+  await agentAClient.request("POST", "/team/messages", { body: "one", idempotencyKey: "team-read-one" }, 201);
+  const latest = await agentAClient.request<{ message: { id: string } }>("POST", "/team/messages", { body: "two", idempotencyKey: "team-read-two" }, 201);
+  const before = await agentBClient.request<{ unreadCount: number }>("GET", "/team/messages");
+  assert.ok(before.unreadCount >= 2);
+  await agentBClient.request("POST", "/team/messages/read", { messageId: latest.message.id });
+  const after = await agentBClient.request<{ unreadCount: number }>("GET", "/team/messages");
+  assert.equal(after.unreadCount, 0);
 });

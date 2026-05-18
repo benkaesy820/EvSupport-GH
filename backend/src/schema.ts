@@ -350,7 +350,6 @@ export const notifications = sqliteTable(
     title: text("title").notNull(),
     body: text("body").notNull(),
     dedupeKey: text("dedupe_key"),
-    emailStatus: text("email_status", { enum: ["none", "pending", "sent", "failed", "throttled"] }).notNull().default("none"),
     readAt: text("read_at"),
     createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   },
@@ -455,20 +454,6 @@ export const rateLimitCounters = sqliteTable(
   (t) => ({
     pk: primaryKey({ columns: [t.scope, t.key, t.windowStart] }),
     expiresIdx: index("rate_limit_counters_expires_idx").on(t.expiresAt),
-  }),
-);
-
-export const outboxEvents = sqliteTable(
-  "outbox_events",
-  {
-    id: text("id").primaryKey(),
-    event: text("event").notNull(),
-    channels: text("channels").notNull(),
-    payload: text("payload").notNull(),
-    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-  },
-  (t) => ({
-    createdIdx: index("outbox_events_created_idx").on(t.createdAt),
   }),
 );
 

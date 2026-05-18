@@ -19,7 +19,7 @@ export function createApp() {
   app.use(
     "*",
     cors({
-      origin: config.CORS_ORIGIN ?? (isProduction ? "" : "http://localhost:3000"),
+      origin: config.CORS_ORIGIN ?? "http://localhost:3000",
       credentials: true,
     }),
   );

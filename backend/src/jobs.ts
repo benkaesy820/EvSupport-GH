@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, lte } from "drizzle-orm";
 import { db } from "./db.js";
-import { announcementTargets, announcements, customers, files, idempotencyKeys, notifications, passwordResetTokens, rateLimitCounters, supportChats, twoFactorChallenges } from "./schema.js";
+import { announcements, files, idempotencyKeys, notifications, passwordResetTokens, rateLimitCounters, twoFactorChallenges } from "./schema.js";
 import { adminChannel, publishEvent, userChannel } from "./events.js";
+import { targetedCustomerIds } from "./content.js";
 
 let timer: NodeJS.Timeout | null = null;
 
@@ -16,31 +17,27 @@ export async function runDueJobs() {
     .returning();
 
   for (const announcement of dueAnnouncements) {
-    const customerRows = await db.select().from(customers);
-    const targets = await db.select().from(announcementTargets).where(eq(announcementTargets.announcementId, announcement.id));
-    const values = new Set(targets.map((target) => target.targetValue));
-    for (const customer of customerRows) {
-      let visible = announcement.targetType === "all_customers" || customer.tags.some((tag) => values.has(tag));
-      if (!visible && announcement.targetType === "category") {
-        const chats = await db.select({ category: supportChats.category }).from(supportChats).where(eq(supportChats.customerId, customer.userId)).limit(1);
-        visible = Boolean(chats[0] && values.has(chats[0].category));
-      }
-      if (!visible) continue;
+    const customerIds = await targetedCustomerIds(announcement);
+    for (const customerId of customerIds) {
       const notificationId = randomUUID();
       await db
         .insert(notifications)
         .values({
           id: notificationId,
-          userId: customer.userId,
+          userId: customerId,
           type: "announcement_published",
           resourceType: "announcement",
           resourceId: announcement.id,
           title: "New announcement",
           body: announcement.title,
-          dedupeKey: `announcement:${announcement.id}:${customer.userId}`,
+          dedupeKey: `announcement:${announcement.id}:${customerId}`,
         })
         .onConflictDoNothing();
-      await publishEvent([userChannel(customer.userId)], "notification:new", { resourceId: notificationId, notificationId, resourceType: "announcement" });
+      await publishEvent([userChannel(customerId)], "notification:new", {
+        resourceId: notificationId,
+        notificationId,
+        resourceType: "announcement",
+      });
     }
     await publishEvent([adminChannel], "announcement:published", {
       resourceId: announcement.id,
