@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1779134015398,
+      "tag": "0000_pink_roughhouse",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1779134770506,
+      "tag": "0001_easy_the_call",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1779135431539,
+      "tag": "0002_old_lionheart",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1779136094242,
+      "tag": "0003_ancient_synch",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1779106116914,
+      "tag": "0004_majestic_the_professor",
+      "breakpoints": true
+    }
+  ]
+}
