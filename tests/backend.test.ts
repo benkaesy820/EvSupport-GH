@@ -98,6 +98,10 @@ async function login(email: string, password: string) {
 
 async function createUser(admin: ApiClient, role: "agent" | "customer", suffix: string) {
   const password = `Created-${suffix}-Password-123!`;
+  if (role === "customer") {
+    const user = await createSeedUser("customer", suffix, password);
+    return { id: user.id, email: user.email, password };
+  }
   const result = await admin.request<{ user: { id: string; email: string } }>("POST", "/admin/users", {
     role,
     email: `${role}-${suffix}@evcomm.test`,
@@ -160,6 +164,51 @@ test("auth sessions, suspension, reset, and force logout are enforced", async ()
 
   await admin.request("PATCH", `/admin/users/${customer.id}`, { status: "suspended" });
   await apiRequest("POST", "/auth/login", { email: customer.email, password: resetPassword }, 403);
+});
+
+test("customer registration, customer invite, approval, and admin creation restrictions work", async () => {
+  const suffix = randomUUID().slice(0, 8);
+  const registered = await apiRequest<{ user: { id: string; status: string }; approvalRequired: boolean }>("POST", "/auth/register", {
+    email: `registered-${suffix}@evcomm.test`,
+    password: `Registered-${suffix}-Password-123!`,
+    displayName: "Registered Customer",
+  }, 201);
+  assert.equal(registered.user.status, "pending_approval");
+  assert.equal(registered.approvalRequired, true);
+  await apiRequest("POST", "/auth/login", { email: `registered-${suffix}@evcomm.test`, password: `Registered-${suffix}-Password-123!` }, 403);
+
+  const pendingCustomers = await admin.request<{ items: Array<{ id: string; status: string }> }>("GET", "/admin/customers");
+  assert.ok(pendingCustomers.items.some((customer) => customer.id === registered.user.id && customer.status === "pending_approval"));
+  await admin.request("POST", `/admin/users/${registered.user.id}/approve`);
+  await login(`registered-${suffix}@evcomm.test`, `Registered-${suffix}-Password-123!`);
+
+  const invite = await admin.request<{ user: { id: string; status: string }; debugSetupToken?: string }>("POST", "/admin/customer-invites", {
+    email: `invited-${suffix}@evcomm.test`,
+    displayName: "Invited Customer",
+  }, 201);
+  assert.equal(invite.user.status, "pending_approval");
+  assert.ok(invite.debugSetupToken);
+  const invitedPassword = `Invited-${suffix}-Password-123!`;
+  await apiRequest("POST", "/auth/password-reset/confirm", { token: invite.debugSetupToken, password: invitedPassword });
+  await apiRequest("POST", "/auth/login", { email: `invited-${suffix}@evcomm.test`, password: invitedPassword }, 403);
+  await admin.request("POST", `/admin/users/${invite.user.id}/approve`);
+  await login(`invited-${suffix}@evcomm.test`, invitedPassword);
+
+  await admin.request("POST", "/admin/users", {
+    role: "customer",
+    email: `blocked-customer-${suffix}@evcomm.test`,
+    password: `Blocked-${suffix}-Password-123!`,
+    displayName: "Blocked Customer",
+  }, 400);
+  await admin.request("POST", "/admin/users", {
+    role: "admin",
+    email: `blocked-admin-${suffix}@evcomm.test`,
+    password: `Blocked-${suffix}-Password-123!`,
+    displayName: "Blocked Admin",
+  }, 400);
+
+  const audit = await admin.request<{ items: Array<{ action: string }> }>("GET", "/admin/audit-logs?action=customer_approved");
+  assert.ok(audit.items.some((item) => item.action === "customer_approved"));
 });
 
 test("chat permissions, state transitions, unread counts, notes, and idempotency work", async () => {

@@ -16,7 +16,7 @@ export type Actor = {
   role: Role;
   email: string;
   displayName: string;
-  status: "active" | "suspended" | "anonymized";
+  status: "pending_approval" | "active" | "suspended" | "anonymized";
   sessionId?: string;
 };
 

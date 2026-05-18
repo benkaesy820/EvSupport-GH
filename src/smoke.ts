@@ -87,12 +87,13 @@ const secondAgent = await admin.request<{ user: { id: string } }>("POST", "/admi
   password: secondAgentPassword,
   displayName: "Smoke Agent 2",
 });
-await admin.request("POST", "/admin/users", {
-  role: "customer",
+const registeredCustomer = await createClient().request<{ user: { id: string; status: string } }>("POST", "/auth/register", {
   email: customerEmail,
   password: customerPassword,
   displayName: "Smoke Customer",
 });
+assert(registeredCustomer.user.status === "pending_approval", "registered customer should require approval");
+await admin.request("POST", `/admin/users/${registeredCustomer.user.id}/approve`);
 
 const customer = await login(customerEmail, customerPassword);
 const current = await customer.request<{ chat: { id: string; status: string } }>("POST", "/chats/current");

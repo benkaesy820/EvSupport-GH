@@ -5,6 +5,7 @@ This backend is the source of truth for roles, permissions, state transitions, f
 ## Auth
 
 - `POST /auth/login` -> password check. Admin/2FA users receive `{ requiresTwoFactor, challengeId }`.
+- `POST /auth/register` -> customer self-registration. Creates a `pending_approval` customer and notifies admins.
 - `POST /auth/2fa/verify` -> creates session cookies and returns `{ user, session }`.
 - `POST /auth/logout`
 - `POST /auth/refresh`
@@ -20,6 +21,8 @@ This backend is the source of truth for roles, permissions, state transitions, f
 - `GET /admin/dashboard`
 - `GET /admin/users`
 - `POST /admin/users`
+- `POST /admin/customer-invites`
+- `POST /admin/users/:id/approve`
 - `PATCH /admin/users/:id`
 - `DELETE /admin/users/:id/anonymize`
 - `DELETE /admin/users/:id/sessions`
@@ -113,3 +116,4 @@ SSE is a delivery hint. Clients should refetch `me`, notifications, chats, open 
 - `npm run build`
 - `npm test` uses isolated file-backed SQLite.
 - `npm run smoke` uses the configured live backend/database.
+Admins are seed/SQL-only. `POST /admin/users` creates agents only. Customers either self-register or are invited, then require admin approval before login.

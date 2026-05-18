@@ -9,8 +9,8 @@ import { db } from "./db.js";
 import { agents, customers, notifications, passwordResetTokens, supportChats, teamMessages, twoFactorChallenges, userSessions, users } from "./schema.js";
 import { audit, actorKey, fail, hashToken, ipKey, rateLimit, requireAuth, requireRole, setAuthCookies, signAccessToken, signRefreshToken, type Actor, type AppContext } from "./security.js";
 import { config, isProduction } from "./config.js";
-import { publishEvent, userChannel } from "./events.js";
-import { sendNewAccountEmail, sendPasswordReset, sendSecurityAlert, sendTwoFactorCode } from "./email.js";
+import { adminChannel, publishEvent, userChannel } from "./events.js";
+import { sendCustomerInvite, sendNewAccountEmail, sendPasswordReset, sendSecurityAlert, sendTwoFactorCode } from "./email.js";
 
 const loginSchema = z.object({
   email: z.string().email().transform((v) => v.toLowerCase()),
@@ -31,13 +31,24 @@ const passwordResetConfirmSchema = z.object({
   password: z.string().min(12),
 });
 
+const registerSchema = z.object({
+  email: z.string().email().transform((v) => v.toLowerCase()),
+  password: z.string().min(12),
+  displayName: z.string().min(1).max(120),
+  phone: z.string().max(50).optional(),
+});
 const createUserSchema = z.object({
-  role: z.enum(["admin", "agent", "customer"]),
+  role: z.literal("agent"),
   email: z.string().email().transform((v) => v.toLowerCase()),
   password: z.string().min(12),
   displayName: z.string().min(1).max(120),
   phone: z.string().max(50).optional(),
   skills: z.array(z.string()).optional(),
+});
+const customerInviteSchema = z.object({
+  email: z.string().email().transform((v) => v.toLowerCase()),
+  displayName: z.string().min(1).max(120),
+  phone: z.string().max(50).optional(),
 });
 const profileSchema = z.object({
   displayName: z.string().min(1).max(120).optional(),
@@ -73,6 +84,39 @@ function publicUser(row: typeof users.$inferSelect) {
     timezone: row.timezone,
     twoFactorEnabled: row.twoFactorEnabled,
   };
+}
+
+async function notifyAdmins(type: string, resourceType: string, resourceId: string, title: string, body: string, dedupePrefix: string) {
+  const admins = await db.select({ id: users.id }).from(users).where(and(eq(users.role, "admin"), eq(users.status, "active")));
+  for (const admin of admins) {
+    const notificationId = randomUUID();
+    await db
+      .insert(notifications)
+      .values({
+        id: notificationId,
+        userId: admin.id,
+        type,
+        resourceType,
+        resourceId,
+        title,
+        body,
+        dedupeKey: `${dedupePrefix}:${resourceId}:${admin.id}`,
+      })
+      .onConflictDoNothing();
+    await publishEvent([userChannel(admin.id)], "notification:new", { resourceId: notificationId, notificationId, resourceType });
+  }
+  await publishEvent([adminChannel], "notification:new", { resourceId, resourceType });
+}
+
+async function createSetupToken(userId: string) {
+  const token = randomBytes(32).toString("base64url");
+  await db.insert(passwordResetTokens).values({
+    id: randomUUID(),
+    userId,
+    tokenHash: hashToken(token),
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  return token;
 }
 
 async function createSession(c: AppContext, user: typeof users.$inferSelect) {
@@ -116,6 +160,29 @@ async function createTwoFactorChallenge(user: typeof users.$inferSelect) {
 }
 
 export function registerAuthRoutes(app: Hono) {
+  app.post("/auth/register", rateLimit({ scope: "auth.register", limit: 5, windowSeconds: 60 * 60, key: ipKey }), async (c: AppContext) => {
+    const body = registerSchema.parse(await c.req.json());
+    const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, body.email)).limit(1);
+    if (existing) fail("CONFLICT", "An account with this email already exists.", 409);
+    const id = randomUUID();
+    await db.transaction(async (tx) => {
+      await tx.insert(users).values({
+        id,
+        role: "customer",
+        email: body.email,
+        passwordHash: await hash(body.password),
+        displayName: body.displayName,
+        phone: body.phone,
+        status: "pending_approval",
+      });
+      await tx.insert(customers).values({ userId: id });
+    });
+    const [created] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    await audit(actorFromUser(created), "customer_registered", "user", id, {}, c.get("requestId"));
+    await notifyAdmins("customer_pending_approval", "user", id, "Customer awaiting approval", `${created.displayName} registered and is waiting for approval.`, "customer-pending");
+    return c.json({ user: publicUser(created), approvalRequired: true }, 201);
+  });
+
   app.post("/auth/login", rateLimit({ scope: "auth.login", limit: 5, windowSeconds: 10 * 60, key: ipKey }), async (c: AppContext) => {
     const body = loginSchema.parse(await c.req.json());
     const [user] = await db.select().from(users).where(eq(users.email, body.email)).limit(1);
@@ -123,6 +190,7 @@ export function registerAuthRoutes(app: Hono) {
     if (!user || !(await verify(user.passwordHash, body.password))) {
       fail("UNAUTHORIZED", "Invalid email or password.", 401);
     }
+    if (user.status === "pending_approval") fail("FORBIDDEN", "Your account is waiting for approval.", 403);
     if (user.status !== "active") fail("FORBIDDEN", "This account is not active.", 403);
     if (user.role === "admin" && !user.twoFactorEnabled) {
       fail("FORBIDDEN", "Admin accounts require two-factor authentication before production use.", 403);
@@ -231,7 +299,7 @@ export function registerAuthRoutes(app: Hono) {
 
     if (!token) fail("UNAUTHORIZED", "Invalid or expired reset token.", 401);
     const [user] = await db.select().from(users).where(eq(users.id, token.userId)).limit(1);
-    if (!user || user.status !== "active") fail("UNAUTHORIZED", "Invalid or expired reset token.", 401);
+    if (!user || !["active", "pending_approval"].includes(user.status)) fail("UNAUTHORIZED", "Invalid or expired reset token.", 401);
 
     await db.transaction(async (tx) => {
       await tx.update(users).set({ passwordHash: await hash(body.password), updatedAt: new Date().toISOString() }).where(eq(users.id, user.id));
@@ -239,9 +307,11 @@ export function registerAuthRoutes(app: Hono) {
       await tx.update(userSessions).set({ revokedAt: new Date().toISOString() }).where(and(eq(userSessions.userId, user.id), isNull(userSessions.revokedAt)));
     });
 
-    await audit(actorFromUser(user), "password_reset", "user", user.id, {}, c.get("requestId"));
-    await publishEvent([userChannel(user.id)], "force:logout", { resourceId: user.id, reason: "password_reset" });
-    await sendSecurityAlert(user.email, "Your evComm password was reset. If this was not you, contact support immediately.").catch((error) => console.error("security email failed", error));
+    await audit(actorFromUser(user), user.status === "pending_approval" ? "customer_invite_accepted" : "password_reset", "user", user.id, {}, c.get("requestId"));
+    if (user.status === "active") {
+      await publishEvent([userChannel(user.id)], "force:logout", { resourceId: user.id, reason: "password_reset" });
+      await sendSecurityAlert(user.email, "Your evComm password was reset. If this was not you, contact support immediately.").catch((error) => console.error("security email failed", error));
+    }
     return c.json({ ok: true });
   });
 
@@ -313,27 +383,56 @@ export function registerAuthRoutes(app: Hono) {
   app.post("/admin/users", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.users.create", limit: 30, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = createUserSchema.parse(await c.req.json());
+    const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, body.email)).limit(1);
+    if (existing) fail("CONFLICT", "An account with this email already exists.", 409);
     const id = randomUUID();
     const passwordHash = await hash(body.password);
 
     await db.transaction(async (tx) => {
       await tx.insert(users).values({
         id,
-        role: body.role,
+        role: "agent",
         email: body.email,
         passwordHash,
         displayName: body.displayName,
         phone: body.phone,
-        twoFactorEnabled: body.role === "admin",
       });
-      if (body.role === "customer") await tx.insert(customers).values({ userId: id });
-      if (body.role === "agent") await tx.insert(agents).values({ userId: id, skills: body.skills ?? [] });
+      await tx.insert(agents).values({ userId: id, skills: body.skills ?? [] });
     });
 
-    await audit(actor, "user_created", "user", id, { role: body.role }, c.get("requestId"));
+    await audit(actor, "user_created", "user", id, { role: "agent" }, c.get("requestId"));
     await sendNewAccountEmail(body.email, body.password).catch((error) => console.error("new account email failed", error));
     const [created] = await db.select().from(users).where(eq(users.id, id)).limit(1);
     return c.json({ user: publicUser(created) }, 201);
+  });
+
+  app.post("/admin/customer-invites", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.customer_invites", limit: 30, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const body = customerInviteSchema.parse(await c.req.json());
+    const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, body.email)).limit(1);
+    if (existing) fail("CONFLICT", "An account with this email already exists.", 409);
+    const id = randomUUID();
+    const passwordHash = await hash(randomBytes(32).toString("base64url"));
+
+    await db.transaction(async (tx) => {
+      await tx.insert(users).values({
+        id,
+        role: "customer",
+        email: body.email,
+        passwordHash,
+        displayName: body.displayName,
+        phone: body.phone,
+        status: "pending_approval",
+      });
+      await tx.insert(customers).values({ userId: id });
+    });
+
+    const token = await createSetupToken(id);
+    await audit(actor, "customer_invited", "user", id, {}, c.get("requestId"));
+    await notifyAdmins("customer_pending_approval", "user", id, "Customer awaiting approval", `${body.displayName} was invited and is waiting for approval.`, "customer-pending");
+    await sendCustomerInvite(body.email, token).catch((error) => console.error("customer invite email failed", error));
+    const [created] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    return c.json({ user: publicUser(created), debugSetupToken: isProduction ? undefined : token }, 201);
   });
 
   app.get("/admin/users", requireAuth, requireRole("admin"), async (c: AppContext) => {
@@ -388,6 +487,31 @@ export function registerAuthRoutes(app: Hono) {
       .leftJoin(supportChats, eq(supportChats.customerId, customers.userId))
       .limit(100);
     return c.json({ items: rows });
+  });
+
+  app.post("/admin/users/:id/approve", requireAuth, requireRole("admin"), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const targetId = z.string().min(1).parse(c.req.param("id"));
+    const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+    if (!target) fail("NOT_FOUND", "User was not found.", 404);
+    if (target.role !== "customer" || target.status !== "pending_approval") fail("CONFLICT", "Only pending customers can be approved.", 409);
+
+    await db.update(users).set({ status: "active", updatedAt: new Date().toISOString() }).where(eq(users.id, targetId));
+    await audit(actor, "customer_approved", "user", targetId, {}, c.get("requestId"));
+    const notificationId = randomUUID();
+    await db.insert(notifications).values({
+      id: notificationId,
+      userId: targetId,
+      type: "customer_approved",
+      resourceType: "user",
+      resourceId: targetId,
+      title: "Account approved",
+      body: "Your account has been approved. You can now sign in.",
+      dedupeKey: `customer-approved:${targetId}`,
+    }).onConflictDoNothing();
+    await publishEvent([userChannel(targetId)], "notification:new", { resourceId: notificationId, notificationId, resourceType: "user" });
+    const [updated] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+    return c.json({ user: publicUser(updated) });
   });
 
   app.get("/admin/dashboard", requireAuth, requireRole("admin"), async (c: AppContext) => {

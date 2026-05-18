@@ -67,6 +67,16 @@ export async function sendNewAccountEmail(to: string, password: string) {
   });
 }
 
+export async function sendCustomerInvite(to: string, token: string) {
+  const baseUrl = config.FRONTEND_URL ?? "http://localhost:3000";
+  const setupUrl = `${baseUrl.replace(/\/$/, "")}/set-password?token=${encodeURIComponent(token)}`;
+  return sendEmail({
+    to,
+    subject: "Complete your evComm account",
+    text: `Use this link to set your password: ${setupUrl}\nYour account must be approved before you can sign in.`,
+  });
+}
+
 export async function sendSecurityAlert(to: string, message: string) {
   return sendEmail({
     to,

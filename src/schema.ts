@@ -15,7 +15,7 @@ export const users = sqliteTable(
     passwordHash: text("password_hash").notNull(),
     displayName: text("display_name").notNull(),
     avatarFileId: text("avatar_file_id"),
-    status: text("status", { enum: ["active", "suspended", "anonymized"] }).notNull().default("active"),
+    status: text("status", { enum: ["pending_approval", "active", "suspended", "anonymized"] }).notNull().default("active"),
     phone: text("phone"),
     timezone: text("timezone").notNull().default("UTC"),
     notificationPrefs: text("notification_prefs", { mode: "json" }).$type<Record<string, boolean>>().notNull().default({}),
