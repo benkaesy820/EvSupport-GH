@@ -47,6 +47,8 @@ const requiredIndexes = [
   "announcement_reactions_unique",
   "reports_customer_idem_unique",
   "ratings_chat_cycle_customer_unique",
+  "ratings_customer_idem_unique",
+  "chat_assignments_open_chat_unique",
   "notifications_user_unread_idx",
   "team_messages_created_idx",
   "audit_logs_resource_idx",

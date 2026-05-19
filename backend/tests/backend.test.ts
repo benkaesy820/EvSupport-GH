@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
@@ -30,13 +30,19 @@ for (const file of migrations) {
 }
 
 const { hash } = await import("@node-rs/argon2");
-const { and, eq, isNull } = await import("drizzle-orm");
+const { and, eq, inArray, isNull } = await import("drizzle-orm");
 const { createApp } = await import("../src/app.js");
-const { db } = await import("../src/db.js");
+const { db, libsql } = await import("../src/db.js");
+const { runDueJobs } = await import("../src/jobs.js");
 const schema = await import("../src/schema.js");
 
 const app = createApp();
 let ipCounter = 1;
+
+after(async () => {
+  client.close();
+  libsql.close();
+});
 
 type ApiClient = {
   token?: string;
@@ -224,6 +230,7 @@ test("chat permissions, state transitions, unread counts, notes, and idempotency
   const current = await customerClient.request<{ chat: { id: string; status: string; availableActions: Record<string, boolean> } }>("POST", "/chats/current");
   assert.equal(current.chat.status, "open");
   assert.equal(current.chat.availableActions.send_message, true);
+  await agentClient.request("POST", `/chats/${current.chat.id}/typing`, { isTyping: true }, 403);
 
   const first = await customerClient.request<{ message: { id: string } }>("POST", `/chats/${current.chat.id}/messages`, {
     body: "Need support",
@@ -238,19 +245,25 @@ test("chat permissions, state transitions, unread counts, notes, and idempotency
 
   const claimed = await agentClient.request<{ chat: { assignedAgent: { id: string } } }>("POST", `/chats/${current.chat.id}/claim`);
   assert.equal(claimed.chat.assignedAgent.id, agent.id);
-  await agentClient.request("POST", `/chats/${current.chat.id}/internal-notes`, { body: "Support-only note" }, 201);
+  await agentClient.request("POST", `/chats/${current.chat.id}/typing`, { isTyping: true });
+  const note = await agentClient.request<{ note: { id: string } }>("POST", `/chats/${current.chat.id}/internal-notes`, { body: "Support-only note" }, 201);
   const customerDetail = await customerClient.request<{ internalNotes: unknown[]; messages: unknown[]; nextMessageCursor: string | null }>("GET", `/chats/${current.chat.id}?limit=1`);
   assert.equal(customerDetail.internalNotes.length, 0);
   assert.equal(customerDetail.messages.length, 1);
   assert.ok("nextMessageCursor" in customerDetail);
+  await agentClient.request("DELETE", `/internal-notes/${note.note.id}`);
+  const agentDetailAfterDelete = await agentClient.request<{ internalNotes: Array<{ id: string }> }>("GET", `/chats/${current.chat.id}`);
+  assert.ok(!agentDetailAfterDelete.internalNotes.some((item) => item.id === note.note.id));
 
   await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
+  await agentClient.request("POST", `/chats/${current.chat.id}/typing`, { isTyping: true }, 409);
+  await agentClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "Resolved reply", idempotencyKey: "resolved-agent-denial" }, 409);
   const reopened = await customerClient.request<{ chat: { status: string; supportCycle: number } }>("POST", `/chats/${current.chat.id}/messages`, { body: "Still broken", idempotencyKey: "chat-reopen-idem" }, 201);
   assert.equal(reopened.chat.status, "open");
   assert.equal(reopened.chat.supportCycle, 2);
 
   await admin.request("POST", `/chats/${current.chat.id}/status`, { status: "closed" });
-  await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "closed denial" }, 409);
+  await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "closed denial", idempotencyKey: "closed-denial-idem" }, 409);
 });
 
 test("assignment, atomic claim conflict, admin transfer, takeover, and suspended-agent unassignment work", async () => {
@@ -286,11 +299,19 @@ test("file access follows parent resources and owner attachment rules", async ()
   await agentClient.request("POST", `/chats/${chat.id}/claim`);
 
   const fileId = await createReadyFile(customerA.id);
-  await customerAClient.request("POST", `/chats/${chat.id}/messages`, { body: "file", fileIds: [fileId], idempotencyKey: "file-chat-idem" }, 201);
+  const message = await customerAClient.request<{ message: { id: string } }>("POST", `/chats/${chat.id}/messages`, { body: "file", fileIds: [fileId], idempotencyKey: "file-chat-idem" }, 201);
   await customerBClient.request("GET", `/files/${fileId}/download`, undefined, 403);
+  await customerAClient.request("DELETE", `/messages/${message.message.id}`);
+  await customerAClient.request("GET", `/files/${fileId}/download`, undefined, 404);
+  const detail = await customerAClient.request<{ messages: Array<{ id: string; body: string | null; files: unknown[] }> }>("GET", `/chats/${chat.id}`);
+  const deleted = detail.messages.find((row) => row.id === message.message.id);
+  assert.equal(deleted?.body, null);
+  assert.equal(deleted?.files.length, 0);
+  const search = await customerAClient.request<{ groups: { messages: Array<{ messages: { id: string } }> } }>("GET", "/search?q=file");
+  assert.ok(!search.groups.messages.some((row) => row.messages.id === message.message.id));
 
   const otherFile = await createReadyFile(customerB.id);
-  await customerAClient.request("POST", `/chats/${chat.id}/messages`, { body: "bad file", fileIds: [otherFile] }, 403);
+  await customerAClient.request("POST", `/chats/${chat.id}/messages`, { body: "bad file", fileIds: [otherFile], idempotencyKey: "bad-file-idem" }, 403);
 });
 
 test("file intents enforce settings, resource pairing, owner-only unattached downloads, and pending completion", async () => {
@@ -331,6 +352,91 @@ test("file intents enforce settings, resource pairing, owner-only unattached dow
     status: "expired",
   });
   await customerAClient.request("POST", `/files/${expired}/complete`, {}, 409);
+
+  const stalePending = randomUUID();
+  await db.insert(schema.files).values({
+    id: stalePending,
+    ownerId: customerA.id,
+    storageKey: `${customerA.id}/${stalePending}/stale.png`,
+    name: "stale.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+    status: "pending",
+    expiresAt: "2000-01-01T00:00:00.000Z",
+  });
+  await customerAClient.request("POST", `/files/${stalePending}/complete`, {}, 409);
+  const [staleAfter] = await db.select().from(schema.files).where(eq(schema.files.id, stalePending));
+  assert.equal(staleAfter.status, "expired");
+});
+
+test("job cleanup expires stale pending and orphaned ready files", async () => {
+  const customer = await createUser(admin, "customer", "cleanup");
+  const pendingId = randomUUID();
+  const orphanId = randomUUID();
+  const oldNotificationId = randomUUID();
+  const recentNotificationId = randomUUID();
+  await db.insert(schema.files).values({
+    id: pendingId,
+    ownerId: customer.id,
+    storageKey: `${customer.id}/${pendingId}/pending.png`,
+    name: "pending.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+    status: "pending",
+    expiresAt: "2000-01-01T00:00:00.000Z",
+  });
+  await db.insert(schema.files).values({
+    id: orphanId,
+    ownerId: customer.id,
+    storageKey: `${customer.id}/${orphanId}/orphan.png`,
+    name: "orphan.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+    status: "ready",
+    completedAt: "2000-01-01T00:00:00.000Z",
+  });
+  await db.insert(schema.idempotencyKeys).values({
+    scope: "test.cleanup",
+    key: "expired-completed-key",
+    actorId: customer.id,
+    requestHash: "hash",
+    responseJson: { ok: true },
+    status: "completed",
+    expiresAt: "2000-01-01T00:00:00.000Z",
+  });
+  await db.insert(schema.notifications).values({
+    id: oldNotificationId,
+    userId: customer.id,
+    type: "cleanup_old",
+    resourceType: "test",
+    resourceId: oldNotificationId,
+    title: "old",
+    body: "old",
+    readAt: "2000-01-01T00:00:00.000Z",
+  });
+  await db.insert(schema.notifications).values({
+    id: recentNotificationId,
+    userId: customer.id,
+    type: "cleanup_recent",
+    resourceType: "test",
+    resourceId: recentNotificationId,
+    title: "recent",
+    body: "recent",
+    readAt: new Date().toISOString(),
+  });
+
+  await runDueJobs();
+  const rows = await db.select().from(schema.files).where(inArray(schema.files.id, [pendingId, orphanId]));
+  assert.equal(rows.find((row) => row.id === pendingId)?.status, "expired");
+  assert.equal(rows.find((row) => row.id === orphanId)?.status, "expired");
+  const idemRows = await db.select().from(schema.idempotencyKeys).where(eq(schema.idempotencyKeys.scope, "test.cleanup"));
+  assert.equal(idemRows.length, 0);
+  const retainedNotifications = await db
+    .select()
+    .from(schema.notifications)
+    .where(inArray(schema.notifications.id, [oldNotificationId, recentNotificationId]));
+  assert.ok(!retainedNotifications.some((row) => row.id === oldNotificationId));
+  assert.ok(retainedNotifications.some((row) => row.id === recentNotificationId));
 });
 
 test("announcements enforce schedule, targeting, reactions, comments, and counts", async () => {
@@ -426,7 +532,7 @@ test("ratings are resolved-only and unique per support cycle", async () => {
   const agentClient = await login(agent.email, agent.password);
   const customerClient = await login(customer.email, customer.password);
   const { chat } = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
-  await customerClient.request("POST", `/chats/${chat.id}/ratings`, { stars: 5 }, 409);
+  await customerClient.request("POST", `/chats/${chat.id}/ratings`, { stars: 5, idempotencyKey: "rating-before-resolved" }, 409);
   await agentClient.request("POST", `/chats/${chat.id}/claim`);
   await agentClient.request("POST", `/chats/${chat.id}/status`, { status: "resolved" });
   await customerClient.request("POST", `/chats/${chat.id}/ratings`, { stars: 5, idempotencyKey: "rating-one" }, 201);
@@ -456,6 +562,20 @@ test("team chat supports mentions, unread counts, read receipts, delete rules, a
   assert.ok(teamDeleteAudits.length >= 1);
 });
 
+test("deleted team message attachments are hidden", async () => {
+  const agent = await createUser(admin, "agent", "team-file");
+  const agentClient = await login(agent.email, agent.password);
+  const fileId = await createReadyFile(agent.id);
+  const message = await agentClient.request<{ message: { id: string } }>("POST", "/team/messages", {
+    body: "file",
+    fileIds: [fileId],
+    idempotencyKey: "team-file-idem",
+  }, 201);
+  await agentClient.request("GET", `/files/${fileId}/download`);
+  await admin.request("DELETE", `/team/messages/${message.message.id}`);
+  await agentClient.request("GET", `/files/${fileId}/download`, undefined, 404);
+});
+
 test("search, audit filters, notifications, and SSE reconnect state are role-aware", async () => {
   const customer = await createUser(admin, "customer", "search");
   const customerClient = await login(customer.email, customer.password);
@@ -468,6 +588,8 @@ test("search, audit filters, notifications, and SSE reconnect state are role-awa
 
   const customerSearch = await customerClient.request<{ groups: Record<string, unknown[]> }>("GET", "/search?q=Searchable");
   assert.ok(!("users" in customerSearch.groups));
+  assert.ok(Array.isArray(customerSearch.groups.announcements));
+  assert.ok(customerSearch.groups.announcements.length >= 1);
   const adminSearch = await admin.request<{ groups: Record<string, unknown[]> }>("GET", "/search?q=Searchable");
   assert.ok(Array.isArray(adminSearch.groups.announcements));
 
@@ -476,6 +598,16 @@ test("search, audit filters, notifications, and SSE reconnect state are role-awa
   assert.equal(typeof dashboard.counts.resolvedToday, "number");
   const agents = await admin.request<{ items: Array<{ availableActions: { suspend: boolean; revoke_sessions: boolean } }> }>("GET", "/admin/agents");
   assert.ok(agents.items.every((item) => typeof item.availableActions.suspend === "boolean" && typeof item.availableActions.revoke_sessions === "boolean"));
+  const agentForDetail = await createUser(admin, "agent", "detail");
+  const detail = await admin.request<{ agent: { id: string; availability: string; activeChats: number; availableActions: { suspend: boolean } } }>("GET", `/admin/agents/${agentForDetail.id}`);
+  assert.equal(detail.agent.id, agentForDetail.id);
+  assert.equal(typeof detail.agent.activeChats, "number");
+  assert.equal(typeof detail.agent.availableActions.suspend, "boolean");
+  await admin.request("GET", `/admin/agents/${randomUUID()}`, undefined, 404);
+  await admin.request("GET", "/admin/users?role=bogus", undefined, 400);
+  const customerForPatch = await createUser(admin, "customer", "customer-patch");
+  await admin.request("PATCH", `/admin/customers/${customerForPatch.id}`, { tags: ["vip"], internalNotes: "Important customer" });
+  await admin.request("PATCH", `/admin/customers/${customerForPatch.id}`, { accountStatus: "suspended" }, 400);
 
   const audit = await admin.request<{ items: Array<{ action: string }> }>("GET", "/admin/audit-logs?action=announcement_published");
   assert.ok(audit.items.some((item) => item.action === "announcement_published"));
@@ -483,6 +615,137 @@ test("search, audit filters, notifications, and SSE reconnect state are role-awa
   const state = await customerClient.request<{ reconnect: { refetch: string[]; unreadNotifications: number } }>("GET", "/events/state");
   assert.ok(state.reconnect.refetch.includes("notifications"));
   assert.equal(typeof state.reconnect.unreadNotifications, "number");
+});
+
+test("ratings endpoints, takeover leave, agent settings, and quick replies are covered", async () => {
+  const agent = await createUser(admin, "agent", "coverage-agent");
+  const customer = await createUser(admin, "customer", "coverage-customer");
+  const agentClient = await login(agent.email, agent.password);
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+
+  await agentClient.request("POST", `/chats/${current.chat.id}/claim`);
+  await admin.request("POST", `/chats/${current.chat.id}/takeover`, { mode: "join" });
+  await admin.request("DELETE", `/chats/${current.chat.id}/takeover`);
+  const participantRows = await db
+    .select()
+    .from(schema.chatAdminParticipants)
+    .where(and(eq(schema.chatAdminParticipants.chatId, current.chat.id), eq(schema.chatAdminParticipants.adminId, adminSeed.id)));
+  assert.ok(participantRows.some((row) => row.leftAt));
+
+  await admin.request("PATCH", `/admin/agents/${agent.id}`, { availability: "away", skills: ["billing"], capacity: 4 });
+  const detail = await admin.request<{ agent: { availability: string; skills: string[]; capacity: number } }>("GET", `/admin/agents/${agent.id}`);
+  assert.equal(detail.agent.availability, "away");
+  assert.deepEqual(detail.agent.skills, ["billing"]);
+  assert.equal(detail.agent.capacity, 4);
+
+  await agentClient.request("PATCH", "/me/availability", { availability: "available" });
+  await agentClient.request("PATCH", "/me/availability", { skills: ["account"] }, 403);
+  await agentClient.request("PATCH", "/me/availability", { capacity: 20 }, 403);
+
+  await admin.request("PATCH", "/admin/quick-replies", { items: ["First reply", "Second reply"] });
+  const settings = await admin.request<{ settings: { quickReplies: string[] } }>("GET", "/settings");
+  assert.deepEqual(settings.settings.quickReplies, ["First reply", "Second reply"]);
+
+  await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
+  const rating = await customerClient.request<{ rating: { id: string } }>("POST", `/chats/${current.chat.id}/ratings`, {
+    stars: 4,
+    comment: "coverage rating",
+    idempotencyKey: "coverage-rating",
+  }, 201);
+  const ownRatings = await agentClient.request<{ items: Array<{ id: string }>; summary: { count: number; averageStars: number } }>("GET", "/me/ratings");
+  assert.ok(ownRatings.items.some((row) => row.id === rating.rating.id));
+  assert.ok(ownRatings.summary.count >= 1);
+  const adminRatings = await admin.request<{ items: Array<{ id: string; agentDisplayName: string | null; customerDisplayName: string | null }>; summary: { count: number } }>("GET", "/admin/ratings");
+  assert.ok(adminRatings.items.some((row) => row.id === rating.rating.id && row.agentDisplayName && row.customerDisplayName));
+  assert.ok(adminRatings.summary.count >= 1);
+});
+
+test("profile avatar files are ready, unattached, immutable, and visible as avatars", async () => {
+  const customerA = await createUser(admin, "customer", "avatar-a");
+  const customerB = await createUser(admin, "customer", "avatar-b");
+  const customerAClient = await login(customerA.email, customerA.password);
+  const customerBClient = await login(customerB.email, customerB.password);
+
+  const avatarFileId = await createReadyFile(customerA.id);
+  await customerAClient.request("PATCH", "/me", { avatarFileId });
+  await customerBClient.request("GET", `/files/${avatarFileId}/download`);
+  await customerAClient.request("POST", `/chats/current`);
+  await customerAClient.request("POST", `/chats/${(await customerAClient.request<{ chat: { id: string } }>("POST", "/chats/current")).chat.id}/messages`, {
+    body: "avatar cannot be reused",
+    fileIds: [avatarFileId],
+    idempotencyKey: "avatar-reuse",
+  }, 409);
+
+  const otherOwnerFileId = await createReadyFile(customerB.id);
+  await customerAClient.request("PATCH", "/me", { avatarFileId: otherOwnerFileId }, 403);
+
+  const pendingFileId = randomUUID();
+  await db.insert(schema.files).values({
+    id: pendingFileId,
+    ownerId: customerA.id,
+    storageKey: `${customerA.id}/${pendingFileId}/pending.png`,
+    name: "pending.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+    status: "pending",
+  });
+  await customerAClient.request("PATCH", "/me", { avatarFileId: pendingFileId }, 409);
+
+  const attachedFileId = await createReadyFile(customerA.id, "report", randomUUID());
+  await customerAClient.request("PATCH", "/me", { avatarFileId: attachedFileId }, 409);
+
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const [updatedUser] = await db.select().from(schema.users).where(eq(schema.users.id, customerA.id));
+  assert.ok(updatedUser.lastActiveAt);
+});
+
+test("admin 2FA restrictions and last-admin destructive guards hold", async () => {
+  await admin.request("POST", "/me/2fa/enroll", undefined, 409);
+  await admin.request("POST", "/me/2fa/disable", { password: adminSeed.password }, 403);
+  await admin.request("PATCH", `/admin/users/${adminSeed.id}`, { status: "suspended" }, 409);
+  await admin.request("DELETE", `/admin/users/${adminSeed.id}/anonymize`, undefined, 409);
+  await admin.request("DELETE", `/admin/users/${adminSeed.id}/sessions`, undefined, 409);
+});
+
+test("admin and agent search cover operational resources without leaking internal notes to customers", async () => {
+  const agent = await createUser(admin, "agent", "search-agent");
+  const customer = await createUser(admin, "customer", "search-customer");
+  const agentClient = await login(agent.email, agent.password);
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+  await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "Findable customer message", idempotencyKey: "findable-message" }, 201);
+  await agentClient.request("POST", `/chats/${current.chat.id}/claim`);
+  await agentClient.request("POST", `/chats/${current.chat.id}/internal-notes`, { body: "Findable internal note" }, 201);
+  await agentClient.request("POST", "/team/messages", { body: "Findable team thread", idempotencyKey: "findable-team" }, 201);
+  await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
+  await customerClient.request("POST", `/chats/${current.chat.id}/ratings`, { stars: 5, comment: "Findable rating", idempotencyKey: "findable-rating" }, 201);
+
+  const adminSearch = await admin.request<{ groups: Record<string, unknown[]> }>("GET", "/search?q=Findable");
+  assert.ok(adminSearch.groups.messages.length >= 1);
+  assert.ok(adminSearch.groups.internalNotes.length >= 1);
+  assert.ok(adminSearch.groups.teamMessages.length >= 1);
+
+  const agentSearch = await agentClient.request<{ groups: Record<string, unknown[]> }>("GET", "/search?q=Findable");
+  assert.ok(agentSearch.groups.messages.length >= 1);
+  assert.ok(agentSearch.groups.internalNotes.length >= 1);
+  assert.ok(agentSearch.groups.teamMessages.length >= 1);
+  assert.ok(agentSearch.groups.ratings.length >= 1);
+
+  const customerSearch = await customerClient.request<{ groups: Record<string, unknown[]> }>("GET", "/search?q=Findable");
+  assert.ok(!("internalNotes" in customerSearch.groups));
+  assert.ok(!("teamMessages" in customerSearch.groups));
+});
+
+test("write idempotency keys are required by contract", async () => {
+  const customer = await createUser(admin, "customer", "required-idem");
+  const agent = await createUser(admin, "agent", "required-idem");
+  const customerClient = await login(customer.email, customer.password);
+  const agentClient = await login(agent.email, agent.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+  await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "missing idempotency" }, 400);
+  await customerClient.request("POST", "/reports", { title: "Missing", category: "bug", description: "missing idempotency" }, 400);
+  await agentClient.request("POST", "/team/messages", { body: "missing idempotency" }, 400);
 });
 
 test("database invariants and migration-created tables exist", async () => {
@@ -579,13 +842,15 @@ test("chat read marks all prior visible unread messages", async () => {
   const agentClient = await login(agent.email, agent.password);
   const customerClient = await login(customer.email, customer.password);
   const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
-  await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "one", idempotencyKey: "read-one" }, 201);
+  const first = await customerClient.request<{ message: { id: string } }>("POST", `/chats/${current.chat.id}/messages`, { body: "one", idempotencyKey: "read-one" }, 201);
   await customerClient.request("POST", `/chats/${current.chat.id}/messages`, { body: "two", idempotencyKey: "read-two" }, 201);
   const latest = await customerClient.request<{ message: { id: string } }>("POST", `/chats/${current.chat.id}/messages`, { body: "three", idempotencyKey: "read-three" }, 201);
   await agentClient.request("POST", `/chats/${current.chat.id}/claim`);
 
   const before = await agentClient.request<{ chat: { unreadCount: number } }>("GET", `/chats/${current.chat.id}`);
   assert.equal(before.chat.unreadCount, 3);
+  const partial = await agentClient.request<{ unreadCount: number }>("POST", `/chats/${current.chat.id}/read`, { messageId: first.message.id });
+  assert.equal(partial.unreadCount, 2);
   await agentClient.request("POST", `/chats/${current.chat.id}/read`, { messageId: latest.message.id });
   const after = await agentClient.request<{ chat: { unreadCount: number } }>("GET", `/chats/${current.chat.id}`);
   assert.equal(after.chat.unreadCount, 0);
@@ -616,6 +881,14 @@ test("announcements cannot be published repeatedly", async () => {
   }, 201);
   await admin.request("POST", `/announcements/${announcement.announcement.id}/publish`, {});
   await admin.request("POST", `/announcements/${announcement.announcement.id}/publish`, {}, 409);
+});
+
+test("targeted announcements require target values", async () => {
+  await admin.request("POST", "/announcements", {
+    title: "No targets",
+    body: "body",
+    targetType: "customer_tag",
+  }, 400);
 });
 
 test("announcement comments listing returns author summaries", async () => {
@@ -658,6 +931,7 @@ test("customer auto-chat created on approval and sender info enriched", async ()
 
 test("chat resolved is idempotent and closing ends open assignment", async () => {
   const agent = await createUser(admin, "agent", "resolveidem");
+  const secondAgent = await createUser(admin, "agent", "resolveidem-second");
   const customer = await createUser(admin, "customer", "resolveidem");
   const customerClient = await login(customer.email, customer.password);
   const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
@@ -671,6 +945,14 @@ test("chat resolved is idempotent and closing ends open assignment", async () =>
     .where(and(eq(schema.notifications.userId, customer.id), eq(schema.notifications.type, "chat_resolved")));
   await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
   await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
+  await admin.request("POST", `/chats/${current.chat.id}/assign`, { agentId: secondAgent.id }, 409);
+  await agentClient.request("POST", `/chats/${current.chat.id}/transfer`, { agentId: secondAgent.id }, 409);
+  const rating = await customerClient.request<{ rating: { id: string } }>("POST", `/chats/${current.chat.id}/ratings`, {
+    stars: 5,
+    idempotencyKey: "resolved-agent-attribution",
+  }, 201);
+  const [ratingRow] = await db.select().from(schema.ratings).where(eq(schema.ratings.id, rating.rating.id));
+  assert.equal(ratingRow.agentId, agent.id);
   const customerNotifsAfter = await db
     .select()
     .from(schema.notifications)
@@ -715,11 +997,101 @@ test("team read marks all prior unread messages", async () => {
   const agentB = await createUser(admin, "agent", "team-read-b");
   const agentAClient = await login(agentA.email, agentA.password);
   const agentBClient = await login(agentB.email, agentB.password);
-  await agentAClient.request("POST", "/team/messages", { body: "one", idempotencyKey: "team-read-one" }, 201);
-  const latest = await agentAClient.request<{ message: { id: string } }>("POST", "/team/messages", { body: "two", idempotencyKey: "team-read-two" }, 201);
+  const first = await agentAClient.request<{ message: { id: string } }>("POST", "/team/messages", { body: "one", idempotencyKey: "team-read-one" }, 201);
+  await agentAClient.request("POST", "/team/messages", { body: "two", idempotencyKey: "team-read-two" }, 201);
+  const latest = await agentAClient.request<{ message: { id: string } }>("POST", "/team/messages", { body: "three", idempotencyKey: "team-read-three" }, 201);
   const before = await agentBClient.request<{ unreadCount: number }>("GET", "/team/messages");
-  assert.ok(before.unreadCount >= 2);
+  assert.ok(before.unreadCount >= 3);
+  const partial = await agentBClient.request<{ unreadCount: number }>("POST", "/team/messages/read", { messageId: first.message.id });
+  assert.equal(partial.unreadCount, 2);
+  await agentBClient.request("POST", "/team/messages/read", { messageId: randomUUID() }, 404);
   await agentBClient.request("POST", "/team/messages/read", { messageId: latest.message.id });
   const after = await agentBClient.request<{ unreadCount: number }>("GET", "/team/messages");
   assert.equal(after.unreadCount, 0);
+});
+
+test("chat upload intents require write access, not just queue visibility", async () => {
+  const agent = await createUser(admin, "agent", "upload-scope");
+  const customer = await createUser(admin, "customer", "upload-scope");
+  const agentClient = await login(agent.email, agent.password);
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+
+  await agentClient.request("POST", "/files/upload-intents", {
+    resourceType: "chat",
+    resourceId: current.chat.id,
+    name: "agent-before-claim.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+  }, 403);
+
+  await agentClient.request("POST", `/chats/${current.chat.id}/claim`);
+  const upload = await agentClient.request<{ fileId: string; uploadUrl: string }>("POST", "/files/upload-intents", {
+    resourceType: "chat",
+    resourceId: current.chat.id,
+    name: "agent-after-claim.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+  });
+  assert.ok(upload.fileId);
+  assert.ok(upload.uploadUrl);
+
+  await agentClient.request("POST", `/chats/${current.chat.id}/status`, { status: "resolved" });
+  await agentClient.request("POST", "/files/upload-intents", {
+    resourceType: "chat",
+    resourceId: current.chat.id,
+    name: "agent-after-resolved.png",
+    mimeType: "image/png",
+    sizeBytes: 32,
+  }, 403);
+});
+
+test("idempotency request hashing is stable across JSON property order", async () => {
+  const customer = await createUser(admin, "customer", "stable-idem");
+  const customerClient = await login(customer.email, customer.password);
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+
+  const first = await customerClient.request<{ message: { id: string } }>("POST", `/chats/${current.chat.id}/messages`, {
+    body: "same body",
+    idempotencyKey: "stable-json-order",
+  }, 201);
+  const replay = await customerClient.request<{ message: { id: string } }>("POST", `/chats/${current.chat.id}/messages`, {
+    idempotencyKey: "stable-json-order",
+    body: "same body",
+  });
+  assert.equal(replay.message.id, first.message.id);
+});
+
+test("announcement patch clears stale targets and delete returns not found", async () => {
+  const announcement = await admin.request<{ announcement: { id: string } }>("POST", "/announcements", {
+    title: "Target cleanup",
+    body: "body",
+    targetType: "customer_tag",
+    targetValues: ["vip"],
+  }, 201);
+
+  await admin.request("PATCH", `/announcements/${announcement.announcement.id}`, { targetType: "all_customers" });
+  const targets = await db.select().from(schema.announcementTargets).where(eq(schema.announcementTargets.announcementId, announcement.announcement.id));
+  assert.equal(targets.length, 0);
+
+  await admin.request("DELETE", `/announcements/${randomUUID()}`, undefined, 404);
+});
+
+test("search treats LIKE wildcards as literal query text", async () => {
+  const result = await admin.request<{ groups: Record<string, unknown[]> }>("GET", `/search?q=${encodeURIComponent("%%")}`);
+  assert.equal(result.groups.users.length, 0);
+  assert.equal(result.groups.reports.length, 0);
+  assert.equal(result.groups.announcements.length, 0);
+});
+
+test("dashboard unassigned count excludes resolved and closed chats", async () => {
+  const customer = await createUser(admin, "customer", "dashboard-unassigned");
+  const customerClient = await login(customer.email, customer.password);
+  const before = await admin.request<{ counts: { unassignedChats: number } }>("GET", "/admin/dashboard");
+  const current = await customerClient.request<{ chat: { id: string } }>("POST", "/chats/current");
+  const open = await admin.request<{ counts: { unassignedChats: number } }>("GET", "/admin/dashboard");
+  assert.equal(open.counts.unassignedChats, before.counts.unassignedChats + 1);
+  await admin.request("POST", `/chats/${current.chat.id}/status`, { status: "closed" });
+  const closed = await admin.request<{ counts: { unassignedChats: number } }>("GET", "/admin/dashboard");
+  assert.equal(closed.counts.unassignedChats, before.counts.unassignedChats);
 });

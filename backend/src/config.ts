@@ -9,8 +9,11 @@ if (existsSync(envPath)) {
     if (!trimmed || trimmed.startsWith("#")) continue;
     const index = trimmed.indexOf("=");
     if (index === -1) continue;
-    const key = trimmed.slice(0, index);
-    const value = trimmed.slice(index + 1);
+    const key = trimmed.slice(0, index).trim();
+    let value = trimmed.slice(index + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
     process.env[key] ??= value;
   }
 }

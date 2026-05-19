@@ -55,19 +55,22 @@ export const requestContext: MiddlewareHandler<Env> = async (c, next) => {
   const started = Date.now();
   const requestId = c.req.header("x-request-id") ?? randomUUID();
   c.set("requestId", requestId);
-  await next();
-  c.header("x-request-id", requestId);
-  const actor = c.get("actor");
-  console.log(
-    JSON.stringify({
-      requestId,
-      method: c.req.method,
-      path: new URL(c.req.url).pathname,
-      status: c.res.status,
-      durationMs: Date.now() - started,
-      actorId: actor?.id,
-    }),
-  );
+  try {
+    await next();
+  } finally {
+    c.header("x-request-id", requestId);
+    const actor = c.get("actor");
+    console.log(
+      JSON.stringify({
+        requestId,
+        method: c.req.method,
+        path: new URL(c.req.url).pathname,
+        status: c.res.status,
+        durationMs: Date.now() - started,
+        actorId: actor?.id,
+      }),
+    );
+  }
 };
 
 export function errorResponse(error: unknown) {
@@ -170,7 +173,7 @@ export function setAuthCookies(c: AppContext, accessToken: string, refreshToken:
   const base = {
     httpOnly: true,
     secure: isProduction,
-    sameSite: "Lax" as const,
+    sameSite: (isProduction ? "None" : "Lax") as "None" | "Lax",
     path: "/",
   };
   setCookie(c, "access_token", accessToken, { ...base, maxAge: 15 * 60 });
@@ -257,8 +260,15 @@ export function rateLimit(policy: RateLimitPolicy): MiddlewareHandler {
   };
 }
 
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJson(entryValue)}`).join(",")}}`;
+}
+
 export function requestHash(value: unknown) {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
 export async function withIdempotency<T>(
@@ -270,26 +280,33 @@ export async function withIdempotency<T>(
 ): Promise<{ value: T; replayed: boolean }> {
   if (!key) return { value: await work(), replayed: false };
   const hash = requestHash(requestBody);
-  const [existing] = await db
-    .select()
-    .from(idempotencyKeys)
-    .where(and(eq(idempotencyKeys.scope, scope), eq(idempotencyKeys.key, key), eq(idempotencyKeys.actorId, actor.id)))
-    .limit(1);
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const inserted = await db
+    .insert(idempotencyKeys)
+    .values({ scope, key, actorId: actor.id, requestHash: hash, status: "in_progress", expiresAt })
+    .onConflictDoNothing()
+    .returning({ key: idempotencyKeys.key });
 
-  if (existing) {
+  if (!inserted.length) {
+    const [existing] = await db
+      .select()
+      .from(idempotencyKeys)
+      .where(and(eq(idempotencyKeys.scope, scope), eq(idempotencyKeys.key, key), eq(idempotencyKeys.actorId, actor.id)))
+      .limit(1);
+    if (!existing) fail("CONFLICT", "A request with this idempotency key is already in progress.", 409);
     if (existing.requestHash !== hash) fail("CONFLICT", "Idempotency key was already used with a different request.", 409);
     if (existing.status === "completed") return { value: existing.responseJson as T, replayed: true };
-    fail("CONFLICT", "A request with this idempotency key is already in progress.", 409);
+    if (existing.status === "failed") {
+      const claimed = await db
+        .update(idempotencyKeys)
+        .set({ status: "in_progress", expiresAt })
+        .where(and(eq(idempotencyKeys.scope, scope), eq(idempotencyKeys.key, key), eq(idempotencyKeys.actorId, actor.id), eq(idempotencyKeys.status, "failed")))
+        .returning({ key: idempotencyKeys.key });
+      if (!claimed.length) fail("CONFLICT", "A request with this idempotency key is already in progress.", 409);
+    } else {
+      fail("CONFLICT", "A request with this idempotency key is already in progress.", 409);
+    }
   }
-
-  await db.insert(idempotencyKeys).values({
-    scope,
-    key,
-    actorId: actor.id,
-    requestHash: hash,
-    status: "in_progress",
-    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-  });
 
   try {
     const value = await work();

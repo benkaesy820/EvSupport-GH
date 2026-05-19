@@ -12,7 +12,7 @@ const chatIdParam = z.object({ id: z.string().min(1) });
 const messageSchema = z.object({
   body: z.string().trim().min(1).max(5000),
   fileIds: z.array(z.string().min(1)).max(10).optional(),
-  idempotencyKey: z.string().min(8).max(120).optional(),
+  idempotencyKey: z.string().min(8).max(120),
 });
 const noteSchema = z.object({ body: z.string().trim().min(1).max(5000) });
 const assignSchema = z.object({ agentId: z.string().min(1) });
@@ -34,12 +34,12 @@ const metaSchema = z.object({
 const ratingSchema = z.object({
   stars: z.number().int().min(1).max(5),
   comment: z.string().max(2000).optional(),
-  idempotencyKey: z.string().min(8).max(120).optional(),
+  idempotencyKey: z.string().min(8).max(120),
 });
 const customerPatchSchema = z.object({
   tags: z.array(z.string().min(1).max(40)).max(20).optional(),
   internalNotes: z.string().max(5000).nullable().optional(),
-});
+}).strict();
 const INBOX_FILTERS = new Set(["mine", "unassigned", "waiting", "resolved", "closed"]);
 
 type ChatRow = typeof supportChats.$inferSelect;
@@ -52,25 +52,35 @@ function actorChannels(actor: Actor, chat: ChatRow) {
   return channels;
 }
 
+function internalChatChannels(actor: Actor, chat: ChatRow) {
+  const channels = [chatChannel(chat.id), adminChannel];
+  if (chat.assignedAgentId) channels.push(userChannel(chat.assignedAgentId));
+  if (actor.role === "agent" && actor.id !== chat.assignedAgentId) channels.push(userChannel(actor.id));
+  return channels;
+}
+
 function availableChatActions(actor: Actor, chat: ChatRow) {
   const isAdmin = actor.role === "admin";
   const isAgentAssigned = actor.role === "agent" && chat.assignedAgentId === actor.id;
   const isCustomer = actor.role === "customer" && chat.customerId === actor.id;
-  const openForMessages = chat.status !== "closed";
+  const activeSupportCycle = chat.status === "open" || chat.status === "waiting";
+  const customerCanReopen = isCustomer && chat.status === "resolved";
+  const supportCanWrite = (isAdmin || isAgentAssigned) && activeSupportCycle;
+  const customerCanWrite = isCustomer && chat.status !== "closed";
 
   return {
-    send_message: openForMessages && (isAdmin || isAgentAssigned || isCustomer),
+    send_message: supportCanWrite || customerCanWrite,
     send_internal_note: isAdmin || isAgentAssigned,
-    claim: actor.role === "agent" && !chat.assignedAgentId && chat.status !== "closed",
-    assign: isAdmin,
-    reassign: isAdmin && Boolean(chat.assignedAgentId),
-    transfer: isAgentAssigned,
-    mark_waiting: (isAdmin || isAgentAssigned) && chat.status !== "closed",
-    resolve: (isAdmin || isAgentAssigned) && chat.status !== "closed",
+    claim: actor.role === "agent" && !chat.assignedAgentId && activeSupportCycle,
+    assign: isAdmin && activeSupportCycle,
+    reassign: isAdmin && Boolean(chat.assignedAgentId) && activeSupportCycle,
+    transfer: isAgentAssigned && activeSupportCycle,
+    mark_waiting: (isAdmin || isAgentAssigned) && activeSupportCycle,
+    resolve: (isAdmin || isAgentAssigned) && activeSupportCycle,
     close: isAdmin && chat.status !== "closed",
-    reopen: isCustomer && chat.status === "resolved",
+    reopen: customerCanReopen,
     delete_message: isAdmin || isAgentAssigned || isCustomer,
-    upload_file: openForMessages && (isAdmin || isAgentAssigned || isCustomer),
+    upload_file: supportCanWrite || customerCanWrite,
     rate: isCustomer && chat.status === "resolved",
   };
 }
@@ -93,9 +103,12 @@ function requireChatView(actor: Actor, chat: ChatRow) {
 
 function requireSupportWrite(actor: Actor, chat: ChatRow) {
   if (chat.status === "closed") fail("CONFLICT", "Closed chats cannot receive messages.", 409);
-  if (actor.role === "admin") return;
-  if (actor.role === "agent" && chat.assignedAgentId === actor.id) return;
+  const activeSupportCycle = chat.status === "open" || chat.status === "waiting";
+  if ((actor.role === "admin" || (actor.role === "agent" && chat.assignedAgentId === actor.id)) && activeSupportCycle) return;
   if (actor.role === "customer" && chat.customerId === actor.id) return;
+  if ((actor.role === "admin" || actor.role === "agent") && chat.status === "resolved") {
+    fail("CONFLICT", "Resolved chats must be reopened before support can reply.", 409);
+  }
   fail("FORBIDDEN", "You cannot write to this chat.", 403);
 }
 
@@ -107,6 +120,7 @@ async function insertNotification(userId: string, type: string, resourceType: st
     .onConflictDoNothing()
     .returning({ id: notifications.id });
   if (inserted.length) await publishEvent([userChannel(userId)], "notification:new", { resourceId: id, notificationId: id, resourceType });
+  return inserted[0]?.id ?? null;
 }
 
 async function defaultChatPriority() {
@@ -137,6 +151,7 @@ async function buildChatResponse(actor: Actor, chat: ChatRow) {
     .where(
       and(
         eq(messages.chatId, chat.id),
+        isNull(messages.deletedAt),
         actor.role === "customer" ? eq(messages.visibleToCustomer, true) : undefined,
         ne(messages.senderId, actor.id),
         sql`not exists (select 1 from message_reads mr where mr.message_id = ${messages.id} and mr.user_id = ${actor.id})`,
@@ -157,6 +172,22 @@ async function buildChatResponse(actor: Actor, chat: ChatRow) {
     lastActivityAt: chat.lastActivityAt,
     availableActions: availableChatActions(actor, chat),
   };
+}
+
+async function chatUnreadCount(actor: Actor, chatId: string) {
+  const [unread] = await db
+    .select({ value: count() })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.chatId, chatId),
+        isNull(messages.deletedAt),
+        actor.role === "customer" ? eq(messages.visibleToCustomer, true) : undefined,
+        ne(messages.senderId, actor.id),
+        sql`not exists (select 1 from message_reads mr where mr.message_id = ${messages.id} and mr.user_id = ${actor.id})`,
+      ),
+    );
+  return unread.value;
 }
 
 async function buildChatList(actor: Actor, chats: ChatRow[]) {
@@ -187,6 +218,7 @@ async function buildChatList(actor: Actor, chats: ChatRow[]) {
     .where(
       and(
         inArray(messages.chatId, chatIds),
+        isNull(messages.deletedAt),
         actor.role === "customer" ? eq(messages.visibleToCustomer, true) : undefined,
         ne(messages.senderId, actor.id),
         sql`not exists (select 1 from message_reads mr where mr.message_id = ${messages.id} and mr.user_id = ${actor.id})`,
@@ -223,11 +255,15 @@ async function attachMessageFiles(messageRows: Array<typeof messages.$inferSelec
     ? await db.select({ id: users.id, displayName: users.displayName, role: users.role, status: users.status }).from(users).where(inArray(users.id, senderIds))
     : [];
   const senderMap = new Map(senderRows.map((row) => [row.id, row]));
-  return messageRows.map((message) => ({
-    ...message,
-    sender: message.senderId ? senderMap.get(message.senderId) ?? null : null,
-    files: links.filter((link) => link.messageId === message.id).map((link) => fileRows.find((file) => file.id === link.fileId)).filter(Boolean),
-  }));
+  return messageRows.map((message) => {
+    const deleted = Boolean(message.deletedAt);
+    return {
+      ...message,
+      body: deleted ? null : message.body,
+      sender: message.senderId ? senderMap.get(message.senderId) ?? null : null,
+      files: deleted ? [] : links.filter((link) => link.messageId === message.id).map((link) => fileRows.find((file) => file.id === link.fileId)).filter(Boolean),
+    };
+  });
 }
 
 async function attachNoteAuthors(noteRows: Array<typeof internalNotes.$inferSelect>) {
@@ -245,8 +281,10 @@ async function assertAttachableFiles(actor: Actor, fileIds: string[] | undefined
   if (!fileIds?.length) return [];
   const rows = await db.select().from(files).where(inArray(files.id, fileIds));
   if (rows.length !== fileIds.length) fail("VALIDATION_ERROR", "One or more files were not found.", 400);
+  const avatarRows = await db.select({ id: users.avatarFileId }).from(users).where(inArray(users.avatarFileId, fileIds));
+  if (avatarRows.length) fail("CONFLICT", "Avatar files cannot be attached to messages or content.", 409);
   for (const file of rows) {
-    if (file.ownerId !== actor.id && actor.role !== "admin") fail("FORBIDDEN", "You can only attach files you uploaded.", 403);
+    if (file.ownerId !== actor.id) fail("FORBIDDEN", "You can only attach files you uploaded.", 403);
     if (file.status !== "ready") fail("CONFLICT", "Only completed files can be attached.", 409);
     if (file.resourceType && (file.resourceType !== resourceType || file.resourceId !== resourceId)) {
       fail("CONFLICT", "File is already attached to another resource.", 409);
@@ -256,7 +294,7 @@ async function assertAttachableFiles(actor: Actor, fileIds: string[] | undefined
 }
 
 async function assignChat(actor: Actor, chat: ChatRow, agentId: string, requestId: string | undefined, reason: "admin_assign" | "transfer") {
-  if (chat.status === "closed") fail("CONFLICT", "Closed chats cannot be assigned.", 409);
+  if (chat.status !== "open" && chat.status !== "waiting") fail("CONFLICT", "Only open or waiting chats can be assigned.", 409);
 
   const [agent] = await db.select().from(users).where(and(eq(users.id, agentId), eq(users.role, "agent"), eq(users.status, "active"))).limit(1);
   if (!agent) fail("VALIDATION_ERROR", "Target agent is not active.", 400);
@@ -344,7 +382,7 @@ export function registerSupportRoutes(app: Hono) {
     const noteRows =
       actor.role === "customer"
         ? []
-        : await db.select().from(internalNotes).where(eq(internalNotes.chatId, id)).orderBy(desc(internalNotes.createdAt)).limit(50);
+        : await db.select().from(internalNotes).where(and(eq(internalNotes.chatId, id), isNull(internalNotes.deletedAt))).orderBy(desc(internalNotes.createdAt)).limit(50);
 
     return c.json({
       chat: await buildChatResponse(actor, chat),
@@ -377,6 +415,7 @@ export function registerSupportRoutes(app: Hono) {
           body: body.body,
           visibleToCustomer: true,
           idempotencyKey: body.idempotencyKey,
+          createdAt: now,
         });
 
         for (const fileId of body.fileIds ?? []) {
@@ -419,7 +458,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json(value, replayed ? 200 : 201);
   });
 
-  app.post("/chats/:id/internal-notes", requireAuth, requireRole("admin", "agent"), async (c: AppContext) => {
+  app.post("/chats/:id/internal-notes", requireAuth, requireRole("admin", "agent"), rateLimit({ scope: "chat.internal_note", limit: 60, windowSeconds: 60, key: actorResourceKey() }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const body = noteSchema.parse(await c.req.json());
@@ -429,12 +468,28 @@ export function registerSupportRoutes(app: Hono) {
     const noteId = randomUUID();
     await db.insert(internalNotes).values({ id: noteId, chatId: id, authorId: actor.id, body: body.body });
     await audit(actor, "internal_note_added", "chat", id, {}, c.get("requestId"));
-    await publishEvent(actorChannels(actor, chat), "message:new", { resourceId: noteId, chatId: id, messageId: noteId, internal: true, actor });
+    await publishEvent(internalChatChannels(actor, chat), "message:new", { resourceId: noteId, chatId: id, messageId: noteId, internal: true, actor });
     const [note] = await db.select().from(internalNotes).where(eq(internalNotes.id, noteId)).limit(1);
-    return c.json({ note }, 201);
+    const [enriched] = await attachNoteAuthors([note]);
+    return c.json({ note: enriched }, 201);
   });
 
-  app.delete("/messages/:id", requireAuth, async (c: AppContext) => {
+  app.delete("/internal-notes/:id", requireAuth, requireRole("admin", "agent"), rateLimit({ scope: "chat.internal_note_delete", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const noteId = z.string().min(1).parse(c.req.param("id"));
+    const [note] = await db.select().from(internalNotes).where(eq(internalNotes.id, noteId)).limit(1);
+    if (!note || note.deletedAt) fail("NOT_FOUND", "Internal note was not found.", 404);
+    const chat = await getChatOrFail(note.chatId);
+    const canDelete = actor.role === "admin" || note.authorId === actor.id;
+    if (!canDelete) fail("FORBIDDEN", "You cannot delete this internal note.", 403);
+
+    await db.update(internalNotes).set({ deletedAt: new Date().toISOString() }).where(eq(internalNotes.id, noteId));
+    await audit(actor, "internal_note_deleted", "internal_note", noteId, { chatId: chat.id }, c.get("requestId"));
+    await publishEvent(internalChatChannels(actor, chat), "message:deleted", { resourceId: noteId, chatId: chat.id, messageId: noteId, internal: true, actor });
+    return c.json({ ok: true });
+  });
+
+  app.delete("/messages/:id", requireAuth, rateLimit({ scope: "chat.message_delete", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const messageId = z.string().min(1).parse(c.req.param("id"));
     const [message] = await db.select().from(messages).where(eq(messages.id, messageId)).limit(1);
@@ -451,7 +506,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json({ message: updated });
   });
 
-  app.post("/chats/:id/read", requireAuth, async (c: AppContext) => {
+  app.post("/chats/:id/read", requireAuth, rateLimit({ scope: "chat.read", limit: 120, windowSeconds: 60, key: actorResourceKey() }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const body = readSchema.parse(await c.req.json().catch(() => ({})));
@@ -472,6 +527,7 @@ export function registerSupportRoutes(app: Hono) {
       .where(
         and(
           eq(messages.chatId, id),
+          isNull(messages.deletedAt),
           actor.role === "customer" ? eq(messages.visibleToCustomer, true) : undefined,
           ne(messages.senderId, actor.id),
           sql`${messages.createdAt} <= ${targetMessage.createdAt}`,
@@ -484,14 +540,14 @@ export function registerSupportRoutes(app: Hono) {
       });
     }
     await publishEvent(actorChannels(actor, chat), "read:receipt", { resourceId: id, chatId: id, messageId, userId: actor.id });
-    return c.json({ ok: true, unreadCount: 0 });
+    return c.json({ ok: true, unreadCount: await chatUnreadCount(actor, id) });
   });
 
   app.post("/chats/:id/typing", requireAuth, rateLimit({ scope: "chat.typing", limit: 30, windowSeconds: 60, key: actorResourceKey() }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const chat = await getChatOrFail(id);
-    requireChatView(actor, chat);
+    requireSupportWrite(actor, chat);
     const body = z.object({ isTyping: z.boolean().default(true) }).parse(await c.req.json().catch(() => ({})));
     await publishEvent(actorChannels(actor, chat), "typing:update", {
       resourceId: id,
@@ -511,7 +567,7 @@ export function registerSupportRoutes(app: Hono) {
     const rows = await db
       .update(supportChats)
       .set({ assignedAgentId: actor.id, updatedAt: now })
-      .where(and(eq(supportChats.id, id), isNull(supportChats.assignedAgentId), ne(supportChats.status, "closed")))
+      .where(and(eq(supportChats.id, id), isNull(supportChats.assignedAgentId), inArray(supportChats.status, ["open", "waiting"])))
       .returning();
 
     if (!rows[0]) fail("CONFLICT", "This chat is no longer available to claim.", 409);
@@ -523,7 +579,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json({ chat: await buildChatResponse(actor, rows[0]) });
   });
 
-  app.post("/chats/:id/assign", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.post("/chats/:id/assign", requireAuth, requireRole("admin"), rateLimit({ scope: "chat.assign", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const body = assignSchema.parse(await c.req.json());
@@ -532,7 +588,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json({ chat: await buildChatResponse(actor, updated) });
   });
 
-  app.post("/chats/:id/transfer", requireAuth, requireRole("admin", "agent"), async (c: AppContext) => {
+  app.post("/chats/:id/transfer", requireAuth, requireRole("admin", "agent"), rateLimit({ scope: "chat.transfer", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const body = assignSchema.parse(await c.req.json());
@@ -542,7 +598,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json({ chat: await buildChatResponse(actor, updated) });
   });
 
-  app.post("/chats/:id/takeover", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.post("/chats/:id/takeover", requireAuth, requireRole("admin"), rateLimit({ scope: "chat.takeover", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const body = takeoverSchema.parse(await c.req.json().catch(() => ({})));
@@ -564,7 +620,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json({ chat: await buildChatResponse(actor, updated) });
   });
 
-  app.delete("/chats/:id/takeover", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.delete("/chats/:id/takeover", requireAuth, requireRole("admin"), rateLimit({ scope: "chat.takeover_leave", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const chat = await getChatOrFail(id);
@@ -580,7 +636,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json({ chat: await buildChatResponse(actor, chat) });
   });
 
-  app.post("/chats/:id/status", requireAuth, requireRole("admin", "agent"), async (c: AppContext) => {
+  app.post("/chats/:id/status", requireAuth, requireRole("admin", "agent"), rateLimit({ scope: "chat.status", limit: 60, windowSeconds: 60, key: actorResourceKey() }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const body = statusSchema.parse(await c.req.json());
@@ -611,9 +667,9 @@ export function registerSupportRoutes(app: Hono) {
     await audit(actor, body.status === "resolved" ? "chat_resolved" : body.status === "closed" ? "chat_closed" : "chat_status_changed", "chat", id, { from: chat.status, to: body.status }, c.get("requestId"));
     const updated = await getChatOrFail(id);
     if (body.status === "resolved") {
-      await insertNotification(chat.customerId, "chat_resolved", "chat", id, "Support chat resolved", "Your support chat was marked resolved.", `chat-resolved:${id}:${updated.supportCycle}`);
+      const notificationId = await insertNotification(chat.customerId, "chat_resolved", "chat", id, "Support chat resolved", "Your support chat was marked resolved.", `chat-resolved:${id}:${updated.supportCycle}`);
       const [customer] = await db.select({ email: users.email, status: users.status }).from(users).where(eq(users.id, chat.customerId)).limit(1);
-      if (customer && customer.status === "active") {
+      if (notificationId && customer && customer.status === "active") {
         await sendChatResolved(customer.email, id).catch((error) => console.error("chat resolved email failed", error));
       }
     }
@@ -621,7 +677,7 @@ export function registerSupportRoutes(app: Hono) {
     return c.json({ chat: await buildChatResponse(actor, updated) });
   });
 
-  app.patch("/chats/:id/meta", requireAuth, requireRole("admin", "agent"), async (c: AppContext) => {
+  app.patch("/chats/:id/meta", requireAuth, requireRole("admin", "agent"), rateLimit({ scope: "chat.meta", limit: 60, windowSeconds: 60, key: actorResourceKey() }), async (c: AppContext) => {
     const actor = c.get("actor");
     const { id } = chatIdParam.parse(c.req.param());
     const body = metaSchema.parse(await c.req.json());
@@ -641,27 +697,30 @@ export function registerSupportRoutes(app: Hono) {
     const chat = await getChatOrFail(id);
     if (chat.customerId !== actor.id) fail("FORBIDDEN", "You can only rate your own support chat.", 403);
     if (chat.status !== "resolved") fail("CONFLICT", "Support can only be rated after it is resolved.", 409);
-    const [existing] = await db
-      .select()
-      .from(ratings)
-      .where(and(eq(ratings.chatId, id), eq(ratings.supportCycle, chat.supportCycle), eq(ratings.customerId, actor.id)))
-      .limit(1);
-    if (existing) fail("CONFLICT", "This support cycle has already been rated.", 409, { ratingId: existing.id });
+    const { value, replayed } = await withIdempotency(actor, "chat.rating", body.idempotencyKey, { chatId: id, ...body }, async () => {
+      const [existing] = await db
+        .select()
+        .from(ratings)
+        .where(and(eq(ratings.chatId, id), eq(ratings.supportCycle, chat.supportCycle), eq(ratings.customerId, actor.id)))
+        .limit(1);
+      if (existing) fail("CONFLICT", "This support cycle has already been rated.", 409, { ratingId: existing.id });
 
-    const ratingId = randomUUID();
-    await db.insert(ratings).values({
-      id: ratingId,
-      chatId: id,
-      supportCycle: chat.supportCycle,
-      customerId: actor.id,
-      agentId: chat.assignedAgentId,
-      stars: body.stars,
-      comment: body.comment,
-      idempotencyKey: body.idempotencyKey,
+      const ratingId = randomUUID();
+      await db.insert(ratings).values({
+        id: ratingId,
+        chatId: id,
+        supportCycle: chat.supportCycle,
+        customerId: actor.id,
+        agentId: chat.assignedAgentId,
+        stars: body.stars,
+        comment: body.comment,
+        idempotencyKey: body.idempotencyKey,
+      });
+      if (chat.assignedAgentId) await insertNotification(chat.assignedAgentId, "rating_received", "rating", ratingId, "New support rating", `${body.stars} star rating received.`);
+      const [rating] = await db.select().from(ratings).where(eq(ratings.id, ratingId)).limit(1);
+      return { rating };
     });
-    if (chat.assignedAgentId) await insertNotification(chat.assignedAgentId, "rating_received", "rating", ratingId, "New support rating", `${body.stars} star rating received.`);
-    const [rating] = await db.select().from(ratings).where(eq(ratings.id, ratingId)).limit(1);
-    return c.json({ rating }, 201);
+    return c.json(value, replayed ? 200 : 201);
   });
 
   app.get("/customers/:id", requireAuth, requireRole("admin", "agent"), async (c: AppContext) => {
@@ -708,7 +767,7 @@ export function registerSupportRoutes(app: Hono) {
     });
   });
 
-  app.patch("/admin/customers/:id", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.patch("/admin/customers/:id", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.customers.patch", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const targetId = z.string().min(1).parse(c.req.param("id"));
     const body = customerPatchSchema.parse(await c.req.json());
@@ -722,7 +781,7 @@ export function registerSupportRoutes(app: Hono) {
 
   app.get("/me/ratings", requireAuth, requireRole("agent"), async (c: AppContext) => {
     const actor = c.get("actor");
-    const limit = Math.min(Number(c.req.query("limit") ?? 50), 100);
+    const limit = z.coerce.number().int().min(1).max(100).default(50).parse(c.req.query("limit") ?? 50);
     const rows = await db
       .select({
         id: ratings.id,
@@ -746,10 +805,9 @@ export function registerSupportRoutes(app: Hono) {
   });
 
   app.get("/admin/ratings", requireAuth, requireRole("admin"), async (c: AppContext) => {
-    const limit = Math.min(Number(c.req.query("limit") ?? 50), 100);
+    const limit = z.coerce.number().int().min(1).max(100).default(50).parse(c.req.query("limit") ?? 50);
     const cursor = c.req.query("cursor");
     const filters = [cursor ? lt(ratings.createdAt, cursor) : undefined].filter(Boolean) as ReturnType<typeof eq>[];
-    const customerJoin = db.$with("customer_join").as(db.select().from(users));
     const rows = await db
       .select({
         id: ratings.id,

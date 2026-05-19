@@ -1,6 +1,6 @@
 # evComm Backend — Task Tracker
 
-Living tracker of everything done, everything still to do, and edge cases not yet covered. Last updated **2026-05-18**.
+Living tracker of everything done, everything still to do, and edge cases not yet covered. Last updated **2026-05-19**.
 
 Status legend: ✅ done · 🟡 partial · ⬜ todo · ⛔ locked (won't do).
 
@@ -105,6 +105,30 @@ Status legend: ✅ done · 🟡 partial · ⬜ todo · ⛔ locked (won't do).
 - ✅ 6 additional backend tests added (26 total, all passing).
 - ✅ Repository was moved to GitHub `main` and force-pushed at commit `f0fe72c`.
 
+### Pass 4 — Continued hardening
+
+- ✅ Added `DELETE /internal-notes/:id`; notes are soft-deleted, hidden from chat detail, audited, and emitted as internal realtime deletion hints.
+- ✅ Added `GET /admin/agents/:id` single-agent detail with profile, workload counts, and available actions.
+- ✅ Broadened admin/agent search to include chats, messages, internal notes, team messages, audit metadata, and own agent ratings where relevant while keeping customer search scoped.
+- ✅ Job cleanup now expires stale pending files and orphaned ready files; production attempts R2 object deletion before marking rows expired.
+- ✅ Expired completed idempotency keys are cleaned up instead of accumulating forever.
+- ✅ `/team/messages/read` now returns `404` for an invalid explicit cursor instead of reporting zero unread.
+- ✅ `/admin/customers/:id` now strictly accepts only `tags` and `internalNotes`, matching the contract.
+- ✅ Customer approval notification SSE is emitted only when the notification row is actually inserted.
+- ✅ Test-mode email sends are skipped so local `.env` provider secrets cannot slow or leak test runs.
+- ✅ Request logging now runs in a `finally` block so failed requests still get structured request logs.
+- ✅ 2 additional hardening tests added (36 total at that pass, all passing).
+
+### Pass 5 — Realtime and resolved-cycle tightening
+
+- ✅ Read every `src/*.ts` file, the product/contract docs, migrations, smoke script, and the full backend test suite.
+- ✅ Tightened chat write permissions so support users can send messages, upload chat files, and emit typing indicators only while a chat is `open` or `waiting`.
+- ✅ Preserved customer reopen behavior: a customer message on a `resolved` chat still reopens the next support cycle.
+- ✅ Blocked claim/assign/transfer on `resolved` chats so late assignment changes cannot corrupt rating attribution.
+- ✅ Clarified typing/SSE behavior in the product spec and backend contract.
+- ✅ Added regression assertions for unassigned typing denial, resolved support typing/message denial, resolved assignment/transfer denial, rating attribution, and resolved upload denial.
+- ✅ Local verification: `npm run typecheck`, `npm run build`, and `npm test` all clean; 39 / 39 tests pass.
+
 ---
 
 ## In progress
@@ -117,40 +141,40 @@ _Nothing currently in progress._
 
 ### Search
 
-- ⬜ Broaden admin `/search` to include chats (by customer name), messages, internal notes, team messages, and audit log metadata. Currently only users + reports + announcements.
-- ⬜ Agent `/search` should include announcements visible to internal users + own ratings + own reports. Currently only chats + team messages.
-- ⬜ Customer `/search` should include published announcements targeted to them. Currently only own messages + own reports.
+- ✅ Broaden admin `/search` to include chats (by customer name), messages, internal notes, team messages, and audit log metadata.
+- ✅ Agent `/search` includes announcements visible to internal users, messages, internal notes, team messages, and own ratings.
+- ✅ Customer `/search` includes published announcements targeted to them and still excludes internal/team data.
 
 ### Lifecycle hygiene
 
-- ⬜ Block destructive admin actions when only one active admin remains (anonymize / suspend / revoke-all-sessions). Currently only self-action is blocked.
-- ⬜ `DELETE /internal-notes/:id` for the note author or admin (column `deletedAt` already exists, route doesn't).
-- ⬜ `GET /admin/agents/:id` single-agent detail (currently only list `/admin/agents`).
+- ✅ Block destructive admin actions when only one active admin remains (anonymize / suspend / revoke-all-sessions).
+- ✅ `DELETE /internal-notes/:id` for the note author or admin.
+- ✅ `GET /admin/agents/:id` single-agent detail.
 
 ### File / notification housekeeping
 
-- ⬜ R2 cleanup: when `runDueJobs` flips `files.status = 'expired'`, also `DeleteObject` from R2 so storage doesn't bloat.
-- ⬜ Orphaned ready files cleanup: any `files` row with `status='ready' AND resourceType IS NULL AND completedAt < now() - 24h` should be expired + deleted from R2 (covers uploaded-but-never-attached).
-- ⬜ Notification retention: delete `notifications` rows where `readAt < now() - 90d` (or per a configurable retention setting).
-- ⬜ Audit log retention policy decision: today it's append-only forever. Either document "no retention" formally OR add an archival cron.
+- ✅ R2 cleanup: when `runDueJobs` expires stale file rows in production, it attempts `DeleteObject` first.
+- ✅ Orphaned ready files cleanup: `status='ready' AND resourceType IS NULL AND completedAt < now() - 24h` is expired and deleted from R2 in production.
+- ✅ Notification retention: job cleanup deletes read `notifications` rows older than 90 days.
+- ✅ Audit log retention policy decision: audit logs are append-only and retained indefinitely by current product contract.
 
 ### Security / deployment
 
 - ⬜ Rotate any credentials that ever lived in local `backend/.env`; replace them in the deployment/GitHub secret store.
 - ⬜ Confirm production deploy/build commands use `backend/` as the working directory after the repo move.
-- ⬜ Run live `npm run db:migrate`, `npm run verify:schema`, and `npm run smoke` against the deployed environment after secrets are rotated.
+- 🟡 Live `npm run db:migrate` and `npm run verify:schema` ran clean on 2026-05-19; `npm run smoke` is still blocked until `SMOKE_ADMIN_PASSWORD` is provided in the environment.
 
 ### Tests still missing for new routes
 
-- ⬜ `/me/ratings` and `/admin/ratings` (just shape + summary).
-- ⬜ `/chats/:id/takeover` DELETE (admin join → leave; `chat_admin_participants.leftAt` set).
-- ⬜ `/admin/agents/:id` PATCH (availability/skills/capacity).
-- ⬜ `/me/availability` PATCH (agent self) — including 403 on skills/capacity changes from agent.
-- ⬜ `/admin/customers/:id` PATCH (tags + internal notes).
-- ⬜ `/admin/quick-replies` PATCH (round-trip via `/settings`).
-- ⬜ `/me/2fa/enroll` for admin returns 409; `/me/2fa/disable` for admin returns 403.
-- ⬜ `PATCH /me` with someone else's `avatarFileId` returns 403; with a non-ready file returns 409.
-- ⬜ `lastActiveAt` updates on the next authenticated request after login.
+- ✅ `/me/ratings` and `/admin/ratings` (shape + summary).
+- ✅ `/chats/:id/takeover` DELETE (admin join → leave; `chat_admin_participants.leftAt` set).
+- ✅ `/admin/agents/:id` PATCH (availability/skills/capacity).
+- ✅ `/me/availability` PATCH (agent self) — including 403 on skills/capacity changes from agent.
+- ✅ `/admin/customers/:id` PATCH (tags + internal notes).
+- ✅ `/admin/quick-replies` PATCH (round-trip via `/settings`).
+- ✅ `/me/2fa/enroll` for admin returns 409; `/me/2fa/disable` for admin returns 403.
+- ✅ `PATCH /me` with someone else's `avatarFileId` returns 403; with a non-ready file returns 409.
+- ✅ `lastActiveAt` updates on the next authenticated request after login.
 - ⬜ Customer approval triggers email (assert via the dev `console.log` path or a stub).
 
 ---
@@ -159,9 +183,9 @@ _Nothing currently in progress._
 
 ### Operational
 
-- ⬜ Job runner overlap guard: `runDueJobs` is on `setInterval(..., 60_000)`. If a run takes >60 s, two runs overlap and could double-fire announcement notifications (dedupe key saves us, but the work is wasted). Wrap with an in-progress flag.
+- ✅ Job runner overlap guard: `runDueJobs` skips a tick while a previous run is still active.
 - ⬜ Email sending: currently `await sendXxx(...)` inside the request path. If Brevo is slow, the request latency suffers. Consider fire-and-forget queueing OR a tiny in-process worker that drains a pending-emails table.
-- ⬜ SSE backpressure: no max client count per user OR globally. A malicious client could open thousands of streams. Add a cap (e.g. 5 per user, 1000 global).
+- ✅ SSE stream caps: max 5 streams per user and 1000 globally.
 - ⬜ Multi-origin CORS: today single `CORS_ORIGIN` env. If we ship a separate mobile/web origin pair, extend to a comma-separated list with origin reflection.
 - ⬜ Structured logger with levels: today `console.log` JSON. A real logger (pino) would give us levels + redaction.
 - ⬜ Phone number format validation in `PATCH /me` (currently any string ≤50 chars).
@@ -229,13 +253,14 @@ All of the below have explicit user-approved decisions. Document, don't implemen
 | --- | --- |
 | `npm run typecheck` | ✅ clean |
 | `npm run build` | ✅ clean |
-| `npm test` | ✅ 26 / 26 pass |
-| GitHub push | ✅ `main` force-pushed at `f0fe72c` |
-| `npm run db:migrate` (Turso) | ⚠️ previously clean; rerun after deploy/secret rotation |
-| `npm run verify:schema` (Turso) | ⚠️ previously clean; rerun after deploy/secret rotation |
-| `npm run smoke` (live local) | ⚠️ previously clean; rerun after deploy/secret rotation |
+| `npm test` | ✅ 39 / 39 pass |
+| GitHub push | ✅ current hardening pass pushed to GitHub `main` |
+| `npm run db:migrate` (Turso) | ✅ migrations applied successfully on 2026-05-19 |
+| `npm run verify:schema` (Turso) | ✅ `{ ok: true, tables: 32, indexes: 17 }` on 2026-05-19 |
+| `npm run smoke` (live local) | ⚠️ blocked: `SMOKE_ADMIN_PASSWORD` is not set |
 | Manual /me spot-check | ✅ `lastActiveAt` populated, `agent` field present for agents, `avatarFileId` exposed |
 | Manual inbox-filter spot-check | ✅ `?filter=mine` and `?filter=unassigned` partition correctly |
+| Resolved-cycle realtime/write guard | ✅ support typing/message/upload/assign/transfer denied after resolve; customer reopen still works |
 
 ---
 
@@ -269,7 +294,7 @@ backend/
     support.ts        (chats, messages, internal notes, assignments, takeover, ratings, customer profile, admin customer PATCH, ratings GET)
     verify-schema.ts  (asserts required tables/indexes exist in target DB)
   tests/
-    backend.test.ts   (26 tests; isolated file-backed SQLite)
+    backend.test.ts   (39 tests; isolated file-backed SQLite)
   backend-contract.md
   product-recommendations.md
   task.md             ← this file

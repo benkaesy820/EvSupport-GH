@@ -6,7 +6,7 @@ import { jwtVerify } from "jose";
 import { and, count, desc, eq, gt, gte, inArray, isNull, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db.js";
-import { agents, chatAssignments, customers, files, notifications, passwordResetTokens, reports, supportChats, systemSettings, teamMessages, twoFactorChallenges, userSessions, users } from "./schema.js";
+import { agents, auditLogs, chatAssignments, customers, files, notifications, passwordResetTokens, reports, supportChats, systemSettings, teamMessages, twoFactorChallenges, userSessions, users } from "./schema.js";
 import { audit, actorKey, fail, hashToken, ipKey, rateLimit, requireAuth, requireRole, setAuthCookies, signAccessToken, signRefreshToken, type Actor, type AppContext } from "./security.js";
 import { config, isProduction } from "./config.js";
 import { adminChannel, publishEvent, userChannel } from "./events.js";
@@ -93,20 +93,37 @@ function publicUser(row: typeof users.$inferSelect) {
   };
 }
 
-function adminUserActions(row: Pick<typeof users.$inferSelect, "id" | "role" | "status">, actorId: string) {
+function adminUserActions(row: Pick<typeof users.$inferSelect, "id" | "role" | "status">, actorId: string, activeAdminCount = 2) {
+  const lastActiveAdmin = row.role === "admin" && row.status === "active" && activeAdminCount <= 1;
   return {
     approve: row.role === "customer" && row.status === "pending_approval",
-    suspend: row.id !== actorId && row.status === "active",
-    anonymize: row.id !== actorId && row.status !== "anonymized",
-    revoke_sessions: row.id !== actorId && row.status !== "anonymized",
+    suspend: row.id !== actorId && row.status === "active" && !lastActiveAdmin,
+    anonymize: row.id !== actorId && row.status !== "anonymized" && !lastActiveAdmin,
+    revoke_sessions: row.id !== actorId && row.status !== "anonymized" && !lastActiveAdmin,
   };
+}
+
+async function activeAdminCount() {
+  const [row] = await db.select({ value: count() }).from(users).where(and(eq(users.role, "admin"), eq(users.status, "active")));
+  return row.value;
+}
+
+function requestIpHash(c: AppContext) {
+  const ip = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
+  return ip ? hashToken(ip) : undefined;
+}
+
+async function assertNotLastActiveAdmin(target: typeof users.$inferSelect, action: string) {
+  if (target.role === "admin" && target.status === "active" && (await activeAdminCount()) <= 1) {
+    fail("CONFLICT", `Cannot ${action} the only active admin.`, 409);
+  }
 }
 
 async function notifyAdmins(type: string, resourceType: string, resourceId: string, title: string, body: string, dedupePrefix: string) {
   const admins = await db.select({ id: users.id }).from(users).where(and(eq(users.role, "admin"), eq(users.status, "active")));
   for (const admin of admins) {
     const notificationId = randomUUID();
-    await db
+    const inserted = await db
       .insert(notifications)
       .values({
         id: notificationId,
@@ -118,8 +135,9 @@ async function notifyAdmins(type: string, resourceType: string, resourceId: stri
         body,
         dedupeKey: `${dedupePrefix}:${resourceId}:${admin.id}`,
       })
-      .onConflictDoNothing();
-    await publishEvent([userChannel(admin.id)], "notification:new", { resourceId: notificationId, notificationId, resourceType });
+      .onConflictDoNothing()
+      .returning({ id: notifications.id });
+    if (inserted.length) await publishEvent([userChannel(admin.id)], "notification:new", { resourceId: notificationId, notificationId, resourceType });
   }
   await publishEvent([adminChannel], "notification:new", { resourceId, resourceType });
 }
@@ -146,6 +164,7 @@ async function createSession(c: AppContext, user: typeof users.$inferSelect) {
     userId: user.id,
     refreshTokenHash: hashToken(refreshToken),
     userAgent: c.req.header("user-agent"),
+    ipHash: requestIpHash(c),
     expiresAt,
   });
 
@@ -382,13 +401,14 @@ export function registerAuthRoutes(app: Hono) {
     });
   });
 
-  app.patch("/me", requireAuth, async (c: AppContext) => {
+  app.patch("/me", requireAuth, rateLimit({ scope: "me.patch", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = profileSchema.parse(await c.req.json());
     if (body.avatarFileId) {
       const [file] = await db.select().from(files).where(eq(files.id, body.avatarFileId)).limit(1);
       if (!file || file.ownerId !== actor.id) fail("FORBIDDEN", "You can only use your own files as an avatar.", 403);
       if (file.status !== "ready") fail("CONFLICT", "Avatar file is not ready.", 409);
+      if (file.resourceType || file.resourceId) fail("CONFLICT", "Avatar files must be unattached uploads.", 409);
     }
     await db.update(users).set({ ...body, updatedAt: new Date().toISOString() }).where(eq(users.id, actor.id));
     const [user] = await db.select().from(users).where(eq(users.id, actor.id)).limit(1);
@@ -504,7 +524,7 @@ export function registerAuthRoutes(app: Hono) {
     });
 
     await audit(actor, "user_created", "user", id, { role: "agent" }, c.get("requestId"));
-    await sendNewAccountEmail(body.email, body.password).catch((error) => console.error("new account email failed", error));
+    await sendNewAccountEmail(body.email).catch((error) => console.error("new account email failed", error));
     const [created] = await db.select().from(users).where(eq(users.id, id)).limit(1);
     return c.json({ user: publicUser(created) }, 201);
   });
@@ -541,19 +561,21 @@ export function registerAuthRoutes(app: Hono) {
 
   app.get("/admin/users", requireAuth, requireRole("admin"), async (c: AppContext) => {
     const actor = c.get("actor");
-    const role = c.req.query("role");
-    const filters = role === "admin" || role === "agent" || role === "customer" ? eq(users.role, role) : undefined;
+    const role = z.enum(["admin", "agent", "customer"]).optional().parse(c.req.query("role"));
+    const filters = role ? eq(users.role, role) : undefined;
+    const adminCount = await activeAdminCount();
     const rows = await db
       .select({ id: users.id, role: users.role, email: users.email, displayName: users.displayName, status: users.status, createdAt: users.createdAt, lastActiveAt: users.lastActiveAt })
       .from(users)
       .where(filters)
       .orderBy(desc(users.createdAt))
       .limit(100);
-    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions(row, actor.id) })) });
+    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions(row, actor.id, adminCount) })) });
   });
 
   app.get("/admin/agents", requireAuth, requireRole("admin"), async (c: AppContext) => {
     const actor = c.get("actor");
+    const adminCount = await activeAdminCount();
     const rows = await db
       .select({
         id: users.id,
@@ -573,11 +595,49 @@ export function registerAuthRoutes(app: Hono) {
       .leftJoin(supportChats, eq(supportChats.assignedAgentId, agents.userId))
       .groupBy(users.id, agents.userId)
       .limit(100);
-    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions({ id: row.id, role: "agent", status: row.status }, actor.id) })) });
+    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions({ id: row.id, role: "agent", status: row.status }, actor.id, adminCount) })) });
+  });
+
+  app.get("/admin/agents/:id", requireAuth, requireRole("admin"), async (c: AppContext) => {
+    const actor = c.get("actor");
+    const targetId = z.string().min(1).parse(c.req.param("id"));
+    const [row] = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        displayName: users.displayName,
+        phone: users.phone,
+        avatarFileId: users.avatarFileId,
+        status: users.status,
+        timezone: users.timezone,
+        lastActiveAt: users.lastActiveAt,
+        createdAt: users.createdAt,
+        availability: agents.availability,
+        skills: agents.skills,
+        capacity: agents.capacity,
+        lastAssignedAt: agents.lastAssignedAt,
+        activeChats: sql<number>`sum(case when ${supportChats.status} = 'open' then 1 else 0 end)`,
+        waitingChats: sql<number>`sum(case when ${supportChats.status} = 'waiting' then 1 else 0 end)`,
+      })
+      .from(agents)
+      .innerJoin(users, eq(users.id, agents.userId))
+      .leftJoin(supportChats, eq(supportChats.assignedAgentId, agents.userId))
+      .where(eq(agents.userId, targetId))
+      .groupBy(users.id, agents.userId)
+      .limit(1);
+    if (!row) fail("NOT_FOUND", "Agent was not found.", 404);
+    const adminCount = await activeAdminCount();
+    return c.json({
+      agent: {
+        ...row,
+        availableActions: adminUserActions({ id: row.id, role: "agent", status: row.status }, actor.id, adminCount),
+      },
+    });
   });
 
   app.get("/admin/customers", requireAuth, requireRole("admin"), async (c: AppContext) => {
     const actor = c.get("actor");
+    const adminCount = await activeAdminCount();
     const rows = await db
       .select({
         id: users.id,
@@ -593,10 +653,10 @@ export function registerAuthRoutes(app: Hono) {
       .innerJoin(users, eq(users.id, customers.userId))
       .leftJoin(supportChats, eq(supportChats.customerId, customers.userId))
       .limit(100);
-    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions({ id: row.id, role: "customer", status: row.status }, actor.id) })) });
+    return c.json({ items: rows.map((row) => ({ ...row, availableActions: adminUserActions({ id: row.id, role: "customer", status: row.status }, actor.id, adminCount) })) });
   });
 
-  app.post("/admin/users/:id/approve", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.post("/admin/users/:id/approve", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.users.approve", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const targetId = z.string().min(1).parse(c.req.param("id"));
     const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
@@ -610,7 +670,7 @@ export function registerAuthRoutes(app: Hono) {
     await audit(actor, "customer_approved", "user", targetId, {}, c.get("requestId"));
     await sendCustomerApproved(target.email).catch((error) => console.error("customer approved email failed", error));
     const notificationId = randomUUID();
-    await db.insert(notifications).values({
+    const inserted = await db.insert(notifications).values({
       id: notificationId,
       userId: targetId,
       type: "customer_approved",
@@ -619,8 +679,8 @@ export function registerAuthRoutes(app: Hono) {
       title: "Account approved",
       body: "Your account has been approved. You can now sign in.",
       dedupeKey: `customer-approved:${targetId}`,
-    }).onConflictDoNothing();
-    await publishEvent([userChannel(targetId)], "notification:new", { resourceId: notificationId, notificationId, resourceType: "user" });
+    }).onConflictDoNothing().returning({ id: notifications.id });
+    if (inserted.length) await publishEvent([userChannel(targetId)], "notification:new", { resourceId: notificationId, notificationId, resourceType: "user" });
     const [updated] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
     await publishEvent([userChannel(targetId), adminChannel], "customer:approved", { resourceId: targetId, userId: targetId, actor });
     return c.json({ user: publicUser(updated) });
@@ -629,12 +689,12 @@ export function registerAuthRoutes(app: Hono) {
   app.get("/admin/dashboard", requireAuth, requireRole("admin"), async (c: AppContext) => {
     const [open] = await db.select({ value: count() }).from(supportChats).where(eq(supportChats.status, "open"));
     const [waiting] = await db.select({ value: count() }).from(supportChats).where(eq(supportChats.status, "waiting"));
-    const [unassigned] = await db.select({ value: count() }).from(supportChats).where(isNull(supportChats.assignedAgentId));
+    const [unassigned] = await db.select({ value: count() }).from(supportChats).where(and(isNull(supportChats.assignedAgentId), inArray(supportChats.status, ["open", "waiting"])));
     const [activeAgents] = await db.select({ value: count() }).from(users).where(and(eq(users.role, "agent"), eq(users.status, "active")));
     const [pendingCustomers] = await db.select({ value: count() }).from(users).where(and(eq(users.role, "customer"), eq(users.status, "pending_approval")));
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
-    const [resolvedToday] = await db.select({ value: count() }).from(supportChats).where(and(eq(supportChats.status, "resolved"), gte(supportChats.updatedAt, today.toISOString())));
+    const [resolvedToday] = await db.select({ value: count() }).from(auditLogs).where(and(eq(auditLogs.action, "chat_resolved"), eq(auditLogs.resourceType, "chat"), gte(auditLogs.createdAt, today.toISOString())));
     const [pendingReports] = await db.select({ value: count() }).from(reports).where(eq(reports.status, "pending"));
     return c.json({
       counts: {
@@ -649,13 +709,15 @@ export function registerAuthRoutes(app: Hono) {
     });
   });
 
-  app.patch("/admin/users/:id", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.patch("/admin/users/:id", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.users.patch", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const targetId = z.string().min(1).parse(c.req.param("id"));
     const body = adminUserPatchSchema.parse(await c.req.json());
     if (targetId === actor.id && body.status === "suspended") fail("CONFLICT", "Admins cannot suspend themselves.", 409);
     const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
     if (!target) fail("NOT_FOUND", "User was not found.", 404);
+    if (target.status === "anonymized") fail("CONFLICT", "Anonymized users cannot be updated.", 409);
+    if (body.status === "suspended") await assertNotLastActiveAdmin(target, "suspend");
 
     await db.transaction(async (tx) => {
       await tx.update(users).set({ ...body, updatedAt: new Date().toISOString() }).where(eq(users.id, targetId));
@@ -678,13 +740,14 @@ export function registerAuthRoutes(app: Hono) {
     return c.json({ user: publicUser(updated) });
   });
 
-  app.delete("/admin/users/:id/anonymize", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.delete("/admin/users/:id/anonymize", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.users.anonymize", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const targetId = z.string().min(1).parse(c.req.param("id"));
     if (targetId === actor.id) fail("CONFLICT", "Admins cannot anonymize themselves.", 409);
     const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
     if (!target) fail("NOT_FOUND", "User was not found.", 404);
     if (target.status === "anonymized") fail("CONFLICT", "User is already anonymized.", 409);
+    await assertNotLastActiveAdmin(target, "anonymize");
     const now = new Date().toISOString();
     await db.transaction(async (tx) => {
       await tx.update(users).set({
@@ -721,6 +784,9 @@ export function registerAuthRoutes(app: Hono) {
     const actor = c.get("actor");
     const targetId = z.string().min(1).parse(c.req.param("id"));
     if (targetId === actor.id) fail("CONFLICT", "Admins cannot revoke all of their own sessions from this endpoint.", 409);
+    const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+    if (!target) fail("NOT_FOUND", "User was not found.", 404);
+    await assertNotLastActiveAdmin(target, "revoke sessions for");
 
     await db.update(userSessions).set({ revokedAt: new Date().toISOString() }).where(and(eq(userSessions.userId, targetId), isNull(userSessions.revokedAt)));
     await audit(actor, "session_revoked", "user", targetId, {}, c.get("requestId"));

@@ -32,6 +32,7 @@ Login uses constant-time argon2 (dummy hash on user-miss) to mitigate timing-bas
 - `DELETE /admin/users/:id/anonymize` — idempotent (rejects if already anonymized). Ends open `chat_assignments` rows for agents; closes open `supportChats` for customers.
 - `DELETE /admin/users/:id/sessions`
 - `GET /admin/agents`
+- `GET /admin/agents/:id`
 - `PATCH /admin/agents/:id` — `{ availability?, skills?, capacity? }`.
 - `GET /admin/customers`
 - `PATCH /admin/customers/:id` — `{ tags?, internalNotes? }`.
@@ -47,18 +48,19 @@ Admins are seed/SQL-only. `POST /admin/users` creates agents only. Customers eit
 - `GET /chats` — supports `?filter=mine|unassigned|waiting|resolved|closed`, `?status=`, `?cursor=`, `?limit=`. List build is fully batched (page-wide IN queries for participants, last messages, and unread counts).
 - `POST /chats/current` — customer-only; idempotent.
 - `GET /chats/:id` — cursor + capped limit for message history; returns `nextMessageCursor`.
-- `POST /chats/:id/messages` — idempotency-key supported. Response includes attached files and `sender` summary.
+- `POST /chats/:id/messages` — idempotency key required. Response includes attached files and `sender` summary. Support users can send only while the chat is `open` or `waiting`; customers can send on `resolved` to reopen; `closed` rejects all messages.
 - `POST /chats/:id/internal-notes` — body only; internal notes do not support file attachments (use chat messages for files).
+- `DELETE /internal-notes/:id` — admin or note author soft-deletes an internal note.
 - `POST /chats/:id/read`
-- `POST /chats/:id/typing`
-- `POST /chats/:id/claim` — atomic.
-- `POST /chats/:id/assign`
-- `POST /chats/:id/transfer`
+- `POST /chats/:id/typing` — same write permission as messages; support-side typing is limited to `open`/`waiting` chats.
+- `POST /chats/:id/claim` — atomic; only unassigned `open`/`waiting` chats.
+- `POST /chats/:id/assign` — admin-only; only `open`/`waiting` chats.
+- `POST /chats/:id/transfer` — only `open`/`waiting` chats.
 - `POST /chats/:id/takeover` — admin join; optional `reassignToSelf` cleanly ends the open `chat_assignments` row.
 - `DELETE /chats/:id/takeover` — admin leave (sets `chat_admin_participants.leftAt`).
 - `POST /chats/:id/status` — no-op (returns current chat) when transitioning to the same status. Closing also ends the open `chat_assignments` row.
 - `PATCH /chats/:id/meta` — priority, category, tags.
-- `POST /chats/:id/ratings` — customer-only; one per `(chatId, supportCycle, customerId)`.
+- `POST /chats/:id/ratings` — customer-only; idempotency key required; one per `(chatId, supportCycle, customerId)`.
 - `DELETE /messages/:id`
 - `GET /customers/:id` — admin sees all. Agent sees only when the customer's current chat is assigned to them or unassigned (PII-scoped). Returns identity, customer profile (tags, internalNotes), chat summary, rating stats.
 - `GET /me/ratings` — agent-only; own ratings + summary.
@@ -71,7 +73,7 @@ Chat responses include backend-computed `availableActions`, `unreadCount`, `last
 - `POST /files/:id/complete`
 - `GET /files/:id/download`
 
-File access follows parent resource access. Production upload completion verifies object metadata in R2. Files are immutable after `ready`; detach/delete is not supported.
+File access follows parent resource access. Chat upload intents follow message-write permissions, so support users cannot attach into `resolved` or `closed` cycles. Production upload completion verifies object metadata in R2. Files are immutable after `ready`; detach/delete is not supported.
 
 ## Announcements
 
@@ -93,7 +95,7 @@ Customers only see published announcements targeted to them. Reactions, comments
 
 - `GET /reports` — batched file fetch.
 - `GET /reports/:id`
-- `POST /reports` — idempotency-key supported; `evidenceMessageIds` snapshot at submit time.
+- `POST /reports` — idempotency key required; `evidenceMessageIds` snapshot at submit time.
 - `PATCH /reports/:id/status` — emits in-app notification AND sends a slow-lane email to the customer. No-op when the status is unchanged (notification + email are skipped).
 - `POST /reports/:id/internal-comments`
 
@@ -110,7 +112,7 @@ Dedupe via `(userId, dedupeKey)` unique index.
 ## Team Chat
 
 - `GET /team/messages` — batched file fetch.
-- `POST /team/messages`
+- `POST /team/messages` — idempotency key required.
 - `POST /team/messages/read`
 - `DELETE /team/messages/:id`
 

@@ -1,6 +1,6 @@
 import { streamSSE } from "hono/streaming";
 import type { Hono } from "hono";
-import { requireAuth, type Actor, type AppContext } from "./security.js";
+import { fail, requireAuth, type Actor, type AppContext } from "./security.js";
 import { db } from "./db.js";
 import { count, eq, isNull, and } from "drizzle-orm";
 import { notifications } from "./schema.js";
@@ -23,6 +23,8 @@ type Client = {
 
 const clients = new Map<string, Client>();
 const clientsByUser = new Map<string, Set<Client>>();
+const MAX_STREAMS_PER_USER = 5;
+const MAX_STREAMS_GLOBAL = 1000;
 
 export function userChannel(userId: string) {
   return `user:${userId}`;
@@ -43,11 +45,23 @@ export async function publishEvent(channels: string[], event: string, data: Omit
   };
 
   const uniqueChannels = new Set(channels);
-  const targets = [...clients.values()].filter((client) =>
-    [...uniqueChannels].some((channel) => client.channels.has(channel)),
-  );
+  const targets = new Set<Client>();
+  const nonUserChannels = new Set<string>();
+  for (const channel of uniqueChannels) {
+    if (channel.startsWith("user:")) {
+      const userId = channel.slice("user:".length);
+      for (const client of clientsByUser.get(userId) ?? []) targets.add(client);
+    } else {
+      nonUserChannels.add(channel);
+    }
+  }
+  if (nonUserChannels.size) {
+    for (const client of clients.values()) {
+      if ([...nonUserChannels].some((channel) => client.channels.has(channel))) targets.add(client);
+    }
+  }
 
-  await Promise.all(targets.map((client) => client.send(event, payload).catch(() => undefined)));
+  await Promise.all([...targets].map((client) => client.send(event, payload).catch(() => undefined)));
 
   if (event === "force:logout") {
     const scopedSessionId = typeof payload.sessionId === "string" ? payload.sessionId : null;
@@ -98,6 +112,8 @@ export function registerEventRoutes(app: Hono) {
 
   app.get("/events", requireAuth, async (c: AppContext) => {
     const actor = c.get("actor");
+    if ((clientsByUser.get(actor.id)?.size ?? 0) >= MAX_STREAMS_PER_USER) fail("RATE_LIMITED", "Too many realtime streams for this user.", 429);
+    if (clients.size >= MAX_STREAMS_GLOBAL) fail("RATE_LIMITED", "Too many realtime streams.", 429);
 
     return streamSSE(c, async (stream) => {
       const clientId = crypto.randomUUID();

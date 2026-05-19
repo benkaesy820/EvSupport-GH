@@ -78,6 +78,7 @@ Statuses: `open`, `waiting`, `resolved`, `closed`.
 
 - A new customer message reopens a `resolved` chat (`supportCycle` increments).
 - Agent can mark waiting; agent or admin can resolve; only admin can close.
+- Support users can send messages, upload chat attachments, and emit typing indicators only while the chat is `open` or `waiting`. Customers can send on `resolved` chats to reopen the next support cycle.
 - Closed chats stay visible in history.
 
 Priority: `normal`, `high`, `urgent`. Set by agent or admin only.
@@ -90,7 +91,7 @@ Priority and category changes write audit records and emit `chat:status_changed`
 
 Chats support text messages, attachments (image preview / file download), read receipts, typing indicators, timestamps, unread counts, soft-delete, and chat-scoped search (via `/search`).
 
-Backend-emitted chat system events: assignment changed, status changed, internal note added, chat transferred, chat resolved.
+Backend-emitted chat system events: assignment changed, status changed, internal note added/deleted, chat transferred, chat resolved.
 
 ## Internal Notes
 
@@ -104,9 +105,9 @@ Each inbox item includes: customer summary, last message preview, status, assign
 
 ## Assignment
 
-- Agent can claim an unassigned chat (atomic).
-- Admin can assign / reassign any chat.
-- Agent can transfer their assigned chat to another active agent.
+- Agent can claim an unassigned `open` or `waiting` chat (atomic).
+- Admin can assign / reassign `open` or `waiting` chats.
+- Agent can transfer their assigned `open` or `waiting` chat to another active agent.
 - Assignment changes notify old and new assignee, write audit records, and emit `chat:assigned` or `chat:reassigned`.
 - If an agent is suspended or anonymized, the open `chat_assignments` row is ended and the chat becomes unassigned.
 
@@ -175,6 +176,7 @@ Server-pushed event types: `message:new`, `message:deleted`, `chat:assigned`, `c
 
 Important rules:
 - SSE is delivery only. All writes go through authenticated HTTP routes.
+- Typing events follow the same write permissions as chat messages; unassigned agents and resolved support cycles cannot generate support-side typing noise.
 - Events emit only AFTER the database transaction commits.
 - On `force:logout` for a user, the backend aborts every live SSE stream for that user immediately (not just notifies).
 - Clients refetch state after reconnect — there is no per-event replay buffer.
@@ -251,7 +253,7 @@ Email delivery failure must never break the DB transaction (`.catch` on every se
 
 ## Audit Log
 
-Append-only log. Records: login, logout, password reset, customer registered/invited/approved, user created/suspended/anonymized/updated, session revoked, chat assigned/reassigned/resolved/closed/status-changed/meta-changed/reopened, admin takeover (join/leave), internal note added, message deleted, announcement created/updated/scheduled/published/deleted, report status changed, file uploaded, settings changed, agent updated, customer updated, two_factor_enabled/disabled, team_message_deleted.
+Append-only log. Records: login, logout, password reset, customer registered/invited/approved, user created/suspended/anonymized/updated, session revoked, chat assigned/reassigned/resolved/closed/status-changed/meta-changed/reopened, admin takeover (join/leave), internal note added/deleted, message deleted, announcement created/updated/scheduled/published/deleted, report status changed, file uploaded, settings changed, agent updated, customer updated, two_factor_enabled/disabled, team_message_deleted.
 
 `GET /admin/audit-logs` supports cursor pagination plus filters: `action`, `resourceType`, `actorId`.
 

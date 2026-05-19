@@ -130,6 +130,7 @@ export const chatAssignments = sqliteTable(
   (t) => ({
     chatIdx: index("chat_assignments_chat_idx").on(t.chatId, t.startedAt),
     agentIdx: index("chat_assignments_agent_idx").on(t.agentId, t.endedAt),
+    openChatUnique: uniqueIndex("chat_assignments_open_chat_unique").on(t.chatId).where(sql`${t.endedAt} is null`),
   }),
 );
 
@@ -335,6 +336,7 @@ export const ratings = sqliteTable(
   },
   (t) => ({
     uniqueCycle: uniqueIndex("ratings_chat_cycle_customer_unique").on(t.chatId, t.supportCycle, t.customerId),
+    idemUnique: uniqueIndex("ratings_customer_idem_unique").on(t.customerId, t.idempotencyKey),
     starsCheck: check("ratings_stars_check", sql`${t.stars} >= 1 AND ${t.stars} <= 5`),
   }),
 );

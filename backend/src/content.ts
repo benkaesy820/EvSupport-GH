@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
-import { and, count, desc, eq, inArray, isNull, like, lt, ne, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db.js";
 import {
@@ -13,8 +13,10 @@ import {
   auditLogs,
   customers,
   files,
+  internalNotes,
   messages,
   notifications,
+  ratings,
   reportFiles,
   reportInternalComments,
   reports,
@@ -47,7 +49,7 @@ const reportSchema = z.object({
   description: z.string().trim().min(1).max(10000),
   fileIds: z.array(z.string().min(1)).max(10).optional(),
   evidenceMessageIds: z.array(z.string().min(1)).max(20).optional(),
-  idempotencyKey: z.string().min(8).max(120).optional(),
+  idempotencyKey: z.string().min(8).max(120),
 });
 const reportStatusSchema = z.object({
   status: z.enum(["pending", "reviewed", "resolved", "dismissed"]),
@@ -57,7 +59,7 @@ const teamMessageSchema = z.object({
   body: z.string().trim().min(1).max(5000),
   fileIds: z.array(z.string().min(1)).max(10).optional(),
   mentionUserIds: z.array(z.string().min(1)).max(20).optional(),
-  idempotencyKey: z.string().min(8).max(120).optional(),
+  idempotencyKey: z.string().min(8).max(120),
 });
 const teamReadSchema = z.object({ messageId: z.string().optional() });
 const searchSchema = z.object({ q: z.string().trim().min(2).max(120), limit: z.coerce.number().int().min(1).max(25).default(10) });
@@ -99,6 +101,8 @@ async function assertAttachableFiles(actorId: string, fileIds: string[] | undefi
   if (!fileIds?.length) return;
   const rows = await db.select().from(files).where(inArray(files.id, fileIds));
   if (rows.length !== fileIds.length) fail("VALIDATION_ERROR", "One or more files were not found.", 400);
+  const avatarRows = await db.select({ id: users.avatarFileId }).from(users).where(inArray(users.avatarFileId, fileIds));
+  if (avatarRows.length) fail("CONFLICT", "Avatar files cannot be attached to messages or content.", 409);
   for (const file of rows) {
     if (file.ownerId !== actorId) fail("FORBIDDEN", "You can only attach files you uploaded.", 403);
     if (file.status !== "ready") fail("CONFLICT", "Only completed files can be attached.", 409);
@@ -121,7 +125,11 @@ async function customerAnnouncementVisible(userId: string, announcement: typeof 
 }
 
 export async function targetedCustomerIds(announcement: typeof announcements.$inferSelect) {
-  const customerRows = await db.select({ userId: customers.userId, tags: customers.tags }).from(customers);
+  const customerRows = await db
+    .select({ userId: customers.userId, tags: customers.tags })
+    .from(customers)
+    .innerJoin(users, eq(users.id, customers.userId))
+    .where(and(eq(users.status, "active"), eq(customers.accountStatus, "active")));
   if (announcement.targetType === "all_customers") return customerRows.map((c) => c.userId);
   const targets = await db.select().from(announcementTargets).where(eq(announcementTargets.announcementId, announcement.id));
   const values = new Set(targets.map((target) => target.targetValue));
@@ -146,6 +154,7 @@ async function notification(userId: string, type: string, resourceType: string, 
   const id = randomUUID();
   const inserted = await db.insert(notifications).values({ id, userId, type, resourceType, resourceId, title, body, dedupeKey }).onConflictDoNothing().returning({ id: notifications.id });
   if (inserted.length) await publishEvent([userChannel(userId)], "notification:new", { resourceId: id, notificationId: id, resourceType });
+  return inserted[0]?.id ?? null;
 }
 
 async function teamMessageFileRows(messageId: string) {
@@ -159,6 +168,10 @@ function reportActions(role: string) {
     view_files: role === "admin" || role === "customer",
     comment_internal: role === "admin",
   };
+}
+
+function likeEscaped(column: unknown, term: string) {
+  return sql`${column} like ${term} escape ${"\\"}`;
 }
 
 async function teamUnreadCount(userId: string) {
@@ -204,7 +217,7 @@ export function registerContentRoutes(app: Hono) {
     });
   });
 
-  app.patch("/admin/quick-replies", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.patch("/admin/quick-replies", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.quick_replies", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = quickRepliesSchema.parse(await c.req.json());
     const now = new Date().toISOString();
@@ -216,7 +229,7 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ items: body.items });
   });
 
-  app.patch("/me/availability", requireAuth, requireRole("agent"), async (c: AppContext) => {
+  app.patch("/me/availability", requireAuth, requireRole("agent"), rateLimit({ scope: "me.availability", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = availabilitySchema.parse(await c.req.json());
     if (body.skills !== undefined) fail("FORBIDDEN", "Skills are managed by admins.", 403);
@@ -228,7 +241,7 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ agent: updated });
   });
 
-  app.patch("/admin/agents/:id", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.patch("/admin/agents/:id", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.agents.patch", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const targetId = z.string().min(1).parse(c.req.param("id"));
     const body = availabilitySchema.parse(await c.req.json());
@@ -240,7 +253,7 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ agent: updated });
   });
 
-  app.patch("/admin/settings", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.patch("/admin/settings", requireAuth, requireRole("admin"), rateLimit({ scope: "admin.settings", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = settingsSchema.parse(await c.req.json());
     for (const [key, value] of Object.entries(body)) {
@@ -422,6 +435,7 @@ export function registerContentRoutes(app: Hono) {
   app.post("/announcements", requireAuth, requireRole("admin"), rateLimit({ scope: "announcements.create", limit: 30, windowSeconds: 60 * 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = announcementSchema.parse(await c.req.json());
+    if (body.targetType !== "all_customers" && !body.targetValues?.length) fail("VALIDATION_ERROR", "Targeted announcements require targetValues.", 400);
     const id = randomUUID();
     await assertAttachableFiles(actor.id, body.fileIds, "announcement", id);
     await db.transaction(async (tx) => {
@@ -458,19 +472,23 @@ export function registerContentRoutes(app: Hono) {
     await audit(actor, "announcement_published", "announcement", id, {}, c.get("requestId"));
     for (const userId of await targetedCustomerIds({ ...announcement, status: "published" })) {
       await notification(userId, "announcement_published", "announcement", id, "New announcement", announcement.title, `announcement:${id}:${userId}`);
+      await publishEvent([userChannel(userId)], "announcement:published", { resourceId: id, announcementId: id, title: announcement.title, actor });
     }
     await publishEvent([adminChannel], "announcement:published", { resourceId: id, announcementId: id, title: announcement.title, actor });
     const [published] = await db.select().from(announcements).where(eq(announcements.id, id)).limit(1);
     return c.json({ announcement: { ...published, availableActions: announcementActions(actor.role, published.status) } });
   });
 
-  app.patch("/announcements/:id", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.patch("/announcements/:id", requireAuth, requireRole("admin"), rateLimit({ scope: "announcements.patch", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     const body = announcementPatchSchema.parse(await c.req.json());
     const [announcement] = await db.select().from(announcements).where(eq(announcements.id, id)).limit(1);
     if (!announcement || announcement.status === "deleted") fail("NOT_FOUND", "Announcement was not found.", 404);
     if (announcement.status === "published") fail("CONFLICT", "Published announcements cannot be edited.", 409);
+    const nextTargetType = body.targetType ?? announcement.targetType;
+    if (nextTargetType !== "all_customers" && body.targetType !== undefined && !body.targetValues?.length) fail("VALIDATION_ERROR", "Targeted announcements require targetValues.", 400);
+    if (nextTargetType !== "all_customers" && body.targetValues !== undefined && !body.targetValues.length) fail("VALIDATION_ERROR", "Targeted announcements require targetValues.", 400);
 
     await assertAttachableFiles(actor.id, body.fileIds, "announcement", id);
     await db.transaction(async (tx) => {
@@ -483,7 +501,9 @@ export function registerContentRoutes(app: Hono) {
           updatedAt: new Date().toISOString(),
         })
         .where(eq(announcements.id, id));
-      if (body.targetValues) {
+      if (nextTargetType === "all_customers") {
+        await tx.delete(announcementTargets).where(eq(announcementTargets.announcementId, id));
+      } else if (body.targetValues) {
         await tx.delete(announcementTargets).where(eq(announcementTargets.announcementId, id));
         for (const targetValue of body.targetValues) await tx.insert(announcementTargets).values({ announcementId: id, targetValue }).onConflictDoNothing();
       }
@@ -497,9 +517,11 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ announcement: { ...updated, availableActions: announcementActions(actor.role, updated.status) } });
   });
 
-  app.delete("/announcements/:id", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.delete("/announcements/:id", requireAuth, requireRole("admin"), rateLimit({ scope: "announcements.delete", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
+    const [announcement] = await db.select({ id: announcements.id }).from(announcements).where(eq(announcements.id, id)).limit(1);
+    if (!announcement) fail("NOT_FOUND", "Announcement was not found.", 404);
     await db.update(announcements).set({ status: "deleted", deletedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }).where(eq(announcements.id, id));
     await audit(actor, "announcement_deleted", "announcement", id, {}, c.get("requestId"));
     return c.json({ ok: true });
@@ -516,17 +538,20 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ ok: true });
   });
 
-  app.delete("/announcements/:id/reactions", requireAuth, requireRole("customer"), async (c: AppContext) => {
+  app.delete("/announcements/:id/reactions", requireAuth, requireRole("customer"), rateLimit({ scope: "announcements.react_delete", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     const body = reactionSchema.parse(await c.req.json());
+    const [announcement] = await db.select().from(announcements).where(and(eq(announcements.id, id), eq(announcements.status, "published"))).limit(1);
+    if (!announcement) fail("FORBIDDEN", "Announcement is not available.", 403);
+    if (!(await customerAnnouncementVisible(actor.id, announcement))) fail("FORBIDDEN", "Announcement is not available.", 403);
     await db
       .delete(announcementReactions)
       .where(and(eq(announcementReactions.announcementId, id), eq(announcementReactions.userId, actor.id), eq(announcementReactions.emoji, body.emoji)));
     return c.json({ ok: true });
   });
 
-  app.post("/announcements/:id/comments", requireAuth, requireRole("customer"), async (c: AppContext) => {
+  app.post("/announcements/:id/comments", requireAuth, requireRole("customer"), rateLimit({ scope: "announcements.comment", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     const body = commentSchema.parse(await c.req.json());
@@ -539,7 +564,7 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ comment }, 201);
   });
 
-  app.delete("/announcement-comments/:id", requireAuth, async (c: AppContext) => {
+  app.delete("/announcement-comments/:id", requireAuth, rateLimit({ scope: "announcements.comment_delete", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     const [comment] = await db.select().from(announcementComments).where(eq(announcementComments.id, id)).limit(1);
@@ -610,7 +635,7 @@ export function registerContentRoutes(app: Hono) {
             .select({ id: messages.id, body: messages.body, createdAt: messages.createdAt })
             .from(messages)
             .innerJoin(supportChats, eq(messages.chatId, supportChats.id))
-            .where(and(inArray(messages.id, body.evidenceMessageIds), eq(supportChats.customerId, actor.id), eq(messages.visibleToCustomer, true)))
+            .where(and(inArray(messages.id, body.evidenceMessageIds), eq(supportChats.customerId, actor.id), eq(messages.visibleToCustomer, true), isNull(messages.deletedAt)))
         : [];
       if ((body.evidenceMessageIds?.length ?? 0) !== evidenceSnapshot.length) fail("FORBIDDEN", "One or more evidence messages are not available.", 403);
       await db.transaction(async (tx) => {
@@ -648,7 +673,7 @@ export function registerContentRoutes(app: Hono) {
     return c.json(value, replayed ? 200 : 201);
   });
 
-  app.patch("/reports/:id/status", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.patch("/reports/:id/status", requireAuth, requireRole("admin"), rateLimit({ scope: "reports.status", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     const body = reportStatusSchema.parse(await c.req.json());
@@ -661,7 +686,7 @@ export function registerContentRoutes(app: Hono) {
     const statusChanged = report.status !== body.status;
     if (statusChanged) {
       await audit(actor, "report_status_changed", "report", id, { from: report.status, to: body.status }, c.get("requestId"));
-      await db
+      const inserted = await db
         .insert(notifications)
         .values({
           id: randomUUID(),
@@ -673,18 +698,20 @@ export function registerContentRoutes(app: Hono) {
           body: `Your report is now ${body.status}.`,
           dedupeKey: `report-status:${id}:${body.status}`,
         })
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning({ id: notifications.id });
       const [customer] = await db.select({ email: users.email, status: users.status }).from(users).where(eq(users.id, report.customerId)).limit(1);
-      if (customer && customer.status === "active") {
+      if (inserted.length && customer && customer.status === "active") {
         await sendReportStatusChanged(customer.email, body.status, id).catch((error) => console.error("report status email failed", error));
       }
+      if (inserted.length) await publishEvent([userChannel(report.customerId)], "notification:new", { resourceId: inserted[0].id, notificationId: inserted[0].id, resourceType: "report" });
       await publishEvent([userChannel(report.customerId), adminChannel], "report:status_updated", { resourceId: id, reportId: id, status: body.status, actor });
     }
     const [updated] = await db.select().from(reports).where(eq(reports.id, id)).limit(1);
     return c.json({ report: updated });
   });
 
-  app.post("/reports/:id/internal-comments", requireAuth, requireRole("admin"), async (c: AppContext) => {
+  app.post("/reports/:id/internal-comments", requireAuth, requireRole("admin"), rateLimit({ scope: "reports.internal_comment", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     const body = internalCommentSchema.parse(await c.req.json());
@@ -708,14 +735,14 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ items: rows.slice(0, query.limit), nextCursor: rows.length > query.limit ? rows[query.limit - 1]?.createdAt : null, unreadCount: await unreadNotifications(actor.id) });
   });
 
-  app.post("/notifications/:id/read", requireAuth, async (c: AppContext) => {
+  app.post("/notifications/:id/read", requireAuth, rateLimit({ scope: "notifications.read", limit: 120, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     await db.update(notifications).set({ readAt: new Date().toISOString() }).where(and(eq(notifications.id, id), eq(notifications.userId, actor.id)));
     return c.json({ ok: true, unreadCount: await unreadNotifications(actor.id) });
   });
 
-  app.post("/notifications/read-all", requireAuth, async (c: AppContext) => {
+  app.post("/notifications/read-all", requireAuth, rateLimit({ scope: "notifications.read_all", limit: 30, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     await db.update(notifications).set({ readAt: new Date().toISOString() }).where(and(eq(notifications.userId, actor.id), isNull(notifications.readAt)));
     return c.json({ ok: true, unreadCount: 0 });
@@ -752,9 +779,10 @@ export function registerContentRoutes(app: Hono) {
     const body = teamMessageSchema.parse(await c.req.json());
     const { value, replayed } = await withIdempotency(actor, "team.message", body.idempotencyKey, body, async () => {
       const id = randomUUID();
+      const now = new Date().toISOString();
       await assertAttachableFiles(actor.id, body.fileIds, "team", id);
       await db.transaction(async (tx) => {
-        await tx.insert(teamMessages).values({ id, senderId: actor.id, body: body.body, idempotencyKey: body.idempotencyKey });
+        await tx.insert(teamMessages).values({ id, senderId: actor.id, body: body.body, idempotencyKey: body.idempotencyKey, createdAt: now });
         for (const fileId of body.fileIds ?? []) {
           await tx.update(files).set({ resourceType: "team", resourceId: id }).where(eq(files.id, fileId));
           await tx.insert(teamMessageFiles).values({ messageId: id, fileId }).onConflictDoNothing();
@@ -776,12 +804,13 @@ export function registerContentRoutes(app: Hono) {
     return c.json(value, replayed ? 200 : 201);
   });
 
-  app.post("/team/messages/read", requireAuth, requireRole("admin", "agent"), async (c: AppContext) => {
+  app.post("/team/messages/read", requireAuth, requireRole("admin", "agent"), rateLimit({ scope: "team.read", limit: 120, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const body = teamReadSchema.parse(await c.req.json().catch(() => ({})));
     const [latest] = body.messageId
       ? await db.select().from(teamMessages).where(and(eq(teamMessages.id, body.messageId), isNull(teamMessages.deletedAt))).limit(1)
       : await db.select().from(teamMessages).where(isNull(teamMessages.deletedAt)).orderBy(desc(teamMessages.createdAt)).limit(1);
+    if (body.messageId && !latest) fail("NOT_FOUND", "Team message was not found.", 404);
     if (!latest) return c.json({ ok: true, unreadCount: 0 });
     const rowsToMark = await db
       .select({ id: teamMessages.id })
@@ -796,7 +825,7 @@ export function registerContentRoutes(app: Hono) {
     return c.json({ ok: true, unreadCount: await teamUnreadCount(actor.id) });
   });
 
-  app.delete("/team/messages/:id", requireAuth, requireRole("admin", "agent"), async (c: AppContext) => {
+  app.delete("/team/messages/:id", requireAuth, requireRole("admin", "agent"), rateLimit({ scope: "team.message_delete", limit: 60, windowSeconds: 60, key: actorKey }), async (c: AppContext) => {
     const actor = c.get("actor");
     const id = z.string().min(1).parse(c.req.param("id"));
     const [message] = await db.select().from(teamMessages).where(eq(teamMessages.id, id)).limit(1);
@@ -835,24 +864,83 @@ export function registerContentRoutes(app: Hono) {
     const groups: Record<string, unknown[]> = {};
 
     if (actor.role === "admin") {
-      groups.users = await db.select({ id: users.id, role: users.role, displayName: users.displayName, email: users.email }).from(users).where(or(like(users.email, term), like(users.displayName, term))).limit(query.limit);
-      groups.reports = await db.select().from(reports).where(or(like(reports.title, term), like(reports.description, term))).limit(query.limit);
-      groups.announcements = await db.select().from(announcements).where(or(like(announcements.title, term), like(announcements.body, term))).limit(query.limit);
+      groups.users = await db.select({ id: users.id, role: users.role, displayName: users.displayName, email: users.email }).from(users).where(or(likeEscaped(users.email, term), likeEscaped(users.displayName, term))).limit(query.limit);
+      groups.chats = await db
+        .select({ chat: supportChats, customer: { id: users.id, displayName: users.displayName, email: users.email, status: users.status } })
+        .from(supportChats)
+        .innerJoin(users, eq(users.id, supportChats.customerId))
+        .where(or(likeEscaped(users.displayName, term), likeEscaped(users.email, term), likeEscaped(supportChats.category, term), likeEscaped(supportChats.priority, term)))
+        .limit(query.limit);
+      groups.messages = await db
+        .select({ message: messages, customer: { id: users.id, displayName: users.displayName, status: users.status } })
+        .from(messages)
+        .innerJoin(supportChats, eq(messages.chatId, supportChats.id))
+        .innerJoin(users, eq(users.id, supportChats.customerId))
+        .where(and(isNull(messages.deletedAt), likeEscaped(messages.body, term)))
+        .limit(query.limit);
+      groups.internalNotes = await db
+        .select({ note: internalNotes, customer: { id: users.id, displayName: users.displayName, status: users.status } })
+        .from(internalNotes)
+        .innerJoin(supportChats, eq(internalNotes.chatId, supportChats.id))
+        .innerJoin(users, eq(users.id, supportChats.customerId))
+        .where(and(isNull(internalNotes.deletedAt), likeEscaped(internalNotes.body, term)))
+        .limit(query.limit);
+      groups.teamMessages = await db.select().from(teamMessages).where(and(isNull(teamMessages.deletedAt), likeEscaped(teamMessages.body, term))).limit(query.limit);
+      groups.reports = await db.select().from(reports).where(or(likeEscaped(reports.title, term), likeEscaped(reports.description, term))).limit(query.limit);
+      groups.announcements = await db.select().from(announcements).where(or(likeEscaped(announcements.title, term), likeEscaped(announcements.body, term))).limit(query.limit);
+      groups.auditLogs = await db
+        .select()
+        .from(auditLogs)
+        .where(or(likeEscaped(auditLogs.action, term), likeEscaped(auditLogs.resourceType, term), likeEscaped(auditLogs.resourceId, term), likeEscaped(auditLogs.metadata, term)))
+        .limit(query.limit);
     } else if (actor.role === "agent") {
       groups.chats = await db
-        .select()
+        .select({ chat: supportChats, customer: { id: users.id, displayName: users.displayName, status: users.status } })
         .from(supportChats)
-        .where(or(eq(supportChats.assignedAgentId, actor.id), isNull(supportChats.assignedAgentId)))
+        .innerJoin(users, eq(users.id, supportChats.customerId))
+        .where(and(or(eq(supportChats.assignedAgentId, actor.id), isNull(supportChats.assignedAgentId)), or(likeEscaped(users.displayName, term), likeEscaped(users.email, term))))
         .limit(query.limit);
-      groups.teamMessages = await db.select().from(teamMessages).where(like(teamMessages.body, term)).limit(query.limit);
+      groups.messages = await db
+        .select({ message: messages, customer: { id: users.id, displayName: users.displayName, status: users.status } })
+        .from(messages)
+        .innerJoin(supportChats, eq(messages.chatId, supportChats.id))
+        .innerJoin(users, eq(users.id, supportChats.customerId))
+        .where(and(or(eq(supportChats.assignedAgentId, actor.id), isNull(supportChats.assignedAgentId)), isNull(messages.deletedAt), likeEscaped(messages.body, term)))
+        .limit(query.limit);
+      groups.internalNotes = await db
+        .select({ note: internalNotes, customer: { id: users.id, displayName: users.displayName, status: users.status } })
+        .from(internalNotes)
+        .innerJoin(supportChats, eq(internalNotes.chatId, supportChats.id))
+        .innerJoin(users, eq(users.id, supportChats.customerId))
+        .where(and(or(eq(supportChats.assignedAgentId, actor.id), isNull(supportChats.assignedAgentId)), isNull(internalNotes.deletedAt), likeEscaped(internalNotes.body, term)))
+        .limit(query.limit);
+      groups.teamMessages = await db.select().from(teamMessages).where(and(isNull(teamMessages.deletedAt), likeEscaped(teamMessages.body, term))).limit(query.limit);
+      groups.announcements = await db.select().from(announcements).where(and(eq(announcements.status, "published"), or(likeEscaped(announcements.title, term), likeEscaped(announcements.body, term)))).limit(query.limit);
+      groups.ratings = await db
+        .select({ rating: ratings, customer: { id: users.id, displayName: users.displayName, status: users.status } })
+        .from(ratings)
+        .innerJoin(users, eq(users.id, ratings.customerId))
+        .where(and(eq(ratings.agentId, actor.id), or(likeEscaped(ratings.comment, term), likeEscaped(users.displayName, term))))
+        .limit(query.limit);
     } else {
       groups.messages = await db
         .select()
         .from(messages)
         .innerJoin(supportChats, eq(messages.chatId, supportChats.id))
-        .where(and(eq(supportChats.customerId, actor.id), eq(messages.visibleToCustomer, true), like(messages.body, term)))
+        .where(and(eq(supportChats.customerId, actor.id), eq(messages.visibleToCustomer, true), isNull(messages.deletedAt), likeEscaped(messages.body, term)))
         .limit(query.limit);
-      groups.reports = await db.select().from(reports).where(and(eq(reports.customerId, actor.id), or(like(reports.title, term), like(reports.description, term)))).limit(query.limit);
+      groups.reports = await db.select().from(reports).where(and(eq(reports.customerId, actor.id), or(likeEscaped(reports.title, term), likeEscaped(reports.description, term)))).limit(query.limit);
+      const candidates = await db
+        .select()
+        .from(announcements)
+        .where(and(eq(announcements.status, "published"), or(likeEscaped(announcements.title, term), likeEscaped(announcements.body, term))))
+        .limit(query.limit * 3);
+      const visibleAnnouncements = [];
+      for (const announcement of candidates) {
+        if (await customerAnnouncementVisible(actor.id, announcement)) visibleAnnouncements.push(announcement);
+        if (visibleAnnouncements.length >= query.limit) break;
+      }
+      groups.announcements = visibleAnnouncements;
     }
 
     return c.json({ groups });

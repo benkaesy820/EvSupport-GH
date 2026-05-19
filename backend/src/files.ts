@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import { PutObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Hono } from "hono";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 import { z } from "zod";
 import { config, fileConfig, isProduction } from "./config.js";
 import { db } from "./db.js";
-import { announcementTargets, customers, files, supportChats, reports, announcements, systemSettings } from "./schema.js";
+import { announcementTargets, customers, files, messageFiles, messages, supportChats, reports, announcements, systemSettings, teamMessageFiles, teamMessages, users } from "./schema.js";
 import { actorKey, audit, fail, rateLimit, requireAuth, type Actor, type AppContext } from "./security.js";
 
 const uploadIntentSchema = z.object({
@@ -75,6 +75,60 @@ async function canAccessResource(actor: Actor, resourceType?: string | null, res
   return false;
 }
 
+async function canAttachToResource(actor: Actor, resourceType?: string | null, resourceId?: string | null) {
+  if (!resourceType && !resourceId) return true;
+  if (!resourceType || !resourceId) return false;
+
+  if (resourceType === "team") return actor.role === "admin" || actor.role === "agent";
+
+  if (resourceType === "chat") {
+    const [chat] = await db.select().from(supportChats).where(eq(supportChats.id, resourceId)).limit(1);
+    if (!chat || chat.status === "closed") return false;
+    const activeSupportCycle = chat.status === "open" || chat.status === "waiting";
+    if (actor.role === "customer") return chat.customerId === actor.id;
+    if (actor.role === "admin") return activeSupportCycle;
+    return actor.role === "agent" && chat.assignedAgentId === actor.id && activeSupportCycle;
+  }
+
+  if (resourceType === "report") {
+    const [report] = await db.select().from(reports).where(eq(reports.id, resourceId)).limit(1);
+    return Boolean(report && actor.role === "customer" && report.customerId === actor.id);
+  }
+
+  if (resourceType === "announcement") return actor.role === "admin";
+
+  return false;
+}
+
+async function fileStillVisible(fileId: string, resourceType?: string | null) {
+  if (resourceType === "chat") {
+    const links = await db
+      .select({ deletedAt: messages.deletedAt })
+      .from(messageFiles)
+      .innerJoin(messages, eq(messages.id, messageFiles.messageId))
+      .where(eq(messageFiles.fileId, fileId));
+    return !links.length || links.some((link) => !link.deletedAt);
+  }
+  if (resourceType === "team") {
+    const links = await db
+      .select({ deletedAt: teamMessages.deletedAt })
+      .from(teamMessageFiles)
+      .innerJoin(teamMessages, eq(teamMessages.id, teamMessageFiles.messageId))
+      .where(eq(teamMessageFiles.fileId, fileId));
+    return !links.length || links.some((link) => !link.deletedAt);
+  }
+  return true;
+}
+
+async function isVisibleAvatar(fileId: string) {
+  const [row] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.avatarFileId, fileId), ne(users.status, "anonymized")))
+    .limit(1);
+  return Boolean(row);
+}
+
 async function currentFilePolicy() {
   const rows = await db
     .select()
@@ -97,7 +151,7 @@ export function registerFileRoutes(app: Hono) {
     const policy = await currentFilePolicy();
     if (!policy.allowedTypes.includes(body.mimeType)) fail("VALIDATION_ERROR", "File type is not allowed.", 400);
     if (body.sizeBytes > policy.maxBytes) fail("VALIDATION_ERROR", "File exceeds the maximum allowed size.", 400);
-    if (!(await canAccessResource(actor, body.resourceType, body.resourceId))) fail("FORBIDDEN", "You cannot attach files to this resource.", 403);
+    if (!(await canAttachToResource(actor, body.resourceType, body.resourceId))) fail("FORBIDDEN", "You cannot attach files to this resource.", 403);
 
     const id = randomUUID();
     const storageKey = `${actor.id}/${id}/${body.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
@@ -130,7 +184,12 @@ export function registerFileRoutes(app: Hono) {
     const [file] = await db.select().from(files).where(eq(files.id, id)).limit(1);
     if (!file) fail("NOT_FOUND", "File was not found.", 404);
     if (file.ownerId !== actor.id) fail("FORBIDDEN", "Only the upload owner can complete this file.", 403);
-    if (!(await canAccessResource(actor, file.resourceType, file.resourceId))) fail("FORBIDDEN", "You cannot attach files to this resource.", 403);
+    const nowIso = new Date().toISOString();
+    if (file.status === "pending" && file.expiresAt && file.expiresAt <= nowIso) {
+      await db.update(files).set({ status: "expired" }).where(eq(files.id, id));
+      fail("CONFLICT", "File upload intent has expired.", 409);
+    }
+    if (!(await canAttachToResource(actor, file.resourceType, file.resourceId))) fail("FORBIDDEN", "You cannot attach files to this resource.", 403);
     if (isProduction) {
       const head = await s3Client().send(new HeadObjectCommand({ Bucket: bucket(), Key: file.storageKey })).catch(() => null);
       if (!head) fail("CONFLICT", "Uploaded object was not found in storage.", 409);
@@ -154,8 +213,12 @@ export function registerFileRoutes(app: Hono) {
     const id = z.string().min(1).parse(c.req.param("id"));
     const [file] = await db.select().from(files).where(eq(files.id, id)).limit(1);
     if (!file || file.status !== "ready") fail("NOT_FOUND", "File was not found.", 404);
-    if (!file.resourceType && !file.resourceId && file.ownerId !== actor.id) fail("FORBIDDEN", "You cannot access this file.", 403);
-    if (!(await canAccessResource(actor, file.resourceType, file.resourceId))) fail("FORBIDDEN", "You cannot access this file.", 403);
+    if (!file.resourceType && !file.resourceId) {
+      if (file.ownerId !== actor.id && !(await isVisibleAvatar(file.id))) fail("FORBIDDEN", "You cannot access this file.", 403);
+    } else if (!(await canAccessResource(actor, file.resourceType, file.resourceId))) {
+      fail("FORBIDDEN", "You cannot access this file.", 403);
+    }
+    if (!(await fileStillVisible(file.id, file.resourceType))) fail("NOT_FOUND", "File was not found.", 404);
     const downloadUrl = await getSignedUrl(s3Client(), new GetObjectCommand({ Bucket: bucket(), Key: file.storageKey }), { expiresIn: 10 * 60 });
     return c.json({ downloadUrl });
   });

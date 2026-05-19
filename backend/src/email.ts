@@ -9,10 +9,6 @@ type Email = {
   text: string;
 };
 
-function escapeHtml(value: string) {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
-}
-
 function appUrl() {
   return (config.FRONTEND_URL ?? "http://localhost:3000").replace(/\/$/, "");
 }
@@ -23,6 +19,9 @@ async function optionalEmailEnabled() {
 }
 
 export async function sendEmail(email: Email) {
+  if (config.NODE_ENV === "test") {
+    return { delivered: false, skipped: true };
+  }
   if (!config.BREVO_API_KEY || !config.EMAIL_FROM) {
     if (!isProduction) console.log(`[email:dev] to=${email.to} subject=${email.subject}\n${email.text}`);
     return { delivered: false, skipped: true };
@@ -40,7 +39,6 @@ export async function sendEmail(email: Email) {
       to: [{ email: email.to }],
       subject: email.subject,
       textContent: email.text,
-      htmlContent: `<p>${escapeHtml(email.text).replaceAll("\n", "<br>")}</p>`,
     }),
   });
 
@@ -68,11 +66,11 @@ export async function sendPasswordReset(to: string, token: string) {
   });
 }
 
-export async function sendNewAccountEmail(to: string, password: string) {
+export async function sendNewAccountEmail(to: string) {
   return sendEmail({
     to,
     subject: "Your evComm account is ready",
-    text: `Your evComm account has been created.\nTemporary password: ${password}\nSign in at ${appUrl()} and change it immediately.`,
+    text: `Your evComm account has been created. Sign in at ${appUrl()}.`,
   });
 }
 
